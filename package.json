@@ -1,0 +1,16 @@
+{
+  "name": "everest-plunge-stock-sheet-agent",
+  "version": "1.0.0",
+  "description": "Automates writes to Everest Plunge's stock & fulfillment Google Sheet (per-batch client allocation). Provides the row-insertion primitive; the trigger logic that decides WHEN to call it (matching a closed deal to a batch/product) is deliberately not built yet — that cross-referencing logic against Pipely/Shopify/Xero/Mainfreight isn't defined.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "googleapis": "^140.0.0"
+  }
+}

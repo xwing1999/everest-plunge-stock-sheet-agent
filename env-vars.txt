@@ -1,0 +1,33 @@
+# Reference only — Railway does NOT read this file. Paste real values into
+# Railway's Variables tab directly. Never put real secrets in this file or
+# commit them to git.
+
+# Shared secret for /admin endpoints.
+API_KEY=
+
+# Google OAuth app — can reuse the SAME Google Cloud project/OAuth client
+# as any other Google Sheets integration you have, since this only needs
+# a Client ID/Secret, not a Google Workspace admin setup. Create one at
+# console.cloud.google.com > APIs & Services > Credentials if you don't
+# have one yet, and enable the Google Sheets API on that project.
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# Must exactly match a redirect URI registered on the Google OAuth client,
+# e.g. https://everest-plunge-stock-sheet-agent-production.up.railway.app/oauth/callback
+GOOGLE_REDIRECT_URI=
+
+# Leave blank on first deploy — filled in via the /oauth/start flow. Unlike
+# Xero, this does NOT rotate, so once set it keeps working across restarts
+# with no persistent volume needed.
+GOOGLE_REFRESH_TOKEN=
+
+# The spreadsheet ID from the sheet's URL:
+# https://docs.google.com/spreadsheets/d/THIS_PART_IS_THE_ID/edit
+# This must be a Google Sheet (not the .xlsx file) — if the Operations
+# spreadsheet still only exists as the .xlsx download, upload/convert it to
+# Google Sheets first and share edit access with whichever Google account
+# you authorize this agent with in /oauth/start.
+SHEET_ID=
+
+PORT=3009
