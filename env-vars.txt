@@ -30,4 +30,9 @@ GOOGLE_REFRESH_TOKEN=
 # you authorize this agent with in /oauth/start.
 SHEET_ID=
 
+# Confirmed real tab name (as of the 2026-08-13 export) — includes the
+# emoji, same convention as the batch tabs. Change only if you've actually
+# renamed the tab in the live sheet.
+STOCK_OVERVIEW_TAB=📦 Stock Overview
+
 PORT=3009

@@ -138,6 +138,119 @@ async function insertClientRow(tabName, rowValues) {
 }
 
 // ---------------------------------------------------------------------------
+// STOCK OVERVIEW — this part IS confirmed against a real export (the
+// "📦 Stock Overview" tab, CSV pulled 2026-08-13), unlike the batch-tab
+// logic above which is still written from the sheet's documented structure
+// only. Confirmed real layout:
+//   SKU | Product Name | Model / Size | In Stock | Batch N | Available |
+//   New Orders (Batch N) | Balance | Retail Price (NZD) | Warehouse | Notes
+// The batch number is baked into the column HEADER TEXT itself ("Batch 10",
+// "New Orders (Batch 10)") and shifts every time a new batch cycle starts —
+// so columns are found by pattern match on each read, never by a fixed
+// name or index. Verified from real numbers that Available = In Stock -
+// Batch N, and Balance = Available - New Orders (Batch N); e.g. SKU-002:
+// 15 - 5 = 10 available, 10 - 2 = 8 balance. Treated as a live formula
+// relationship, matching the tab's own header note ("'Available'
+// auto-calculates").
+// ---------------------------------------------------------------------------
+const STOCK_OVERVIEW_TAB = process.env.STOCK_OVERVIEW_TAB || '📦 Stock Overview';
+
+async function getStockOverview() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SHEET_ID,
+    range: STOCK_OVERVIEW_TAB
+  });
+  const rows = res.data.values ?? [];
+
+  const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${STOCK_OVERVIEW_TAB}".`);
+  const headers = rows[headerRowIdx].map((h) => (h ?? '').toString().trim());
+
+  const col = {
+    sku: headers.findIndex((h) => h.toUpperCase() === 'SKU'),
+    productName: headers.findIndex((h) => h.toUpperCase() === 'PRODUCT NAME'),
+    modelSize: headers.findIndex((h) => h.toUpperCase().startsWith('MODEL')),
+    inStock: headers.findIndex((h) => h.toUpperCase() === 'IN STOCK'),
+    reserved: headers.findIndex((h) => /^batch\s*\d+$/i.test(h)),
+    available: headers.findIndex((h) => h.toUpperCase() === 'AVAILABLE'),
+    newOrders: headers.findIndex((h) => /^new orders\s*\(batch\s*\d+\)$/i.test(h)),
+    balance: headers.findIndex((h) => h.toUpperCase() === 'BALANCE')
+  };
+  const missing = Object.entries(col).filter(([, idx]) => idx === -1).map(([name]) => name);
+  if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}. Sheet structure may have changed — check "${STOCK_OVERVIEW_TAB}" by eye before trusting this.`);
+
+  const batchLabel = headers[col.reserved];
+  const products = [];
+  for (let r = headerRowIdx + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const sku = (row[col.sku] ?? '').toString().trim();
+    if (!sku || sku.toUpperCase() === 'TOTALS') break;
+    products.push({
+      sku,
+      productName: row[col.productName] ?? '',
+      modelSize: row[col.modelSize] ?? '',
+      inStock: Number(row[col.inStock] || 0),
+      reserved: Number(row[col.reserved] || 0),
+      available: Number(row[col.available] || 0),
+      newOrders: Number(row[col.newOrders] || 0),
+      balance: Number(row[col.balance] || 0),
+      rowNumber: r + 1 // 1-based sheet row, for writing back to this exact row later
+    });
+  }
+
+  return { batchLabel, products, columns: col };
+}
+
+async function checkStockAvailability(sku, quantity) {
+  const { products, batchLabel } = await getStockOverview();
+  const product = products.find((p) => p.sku === sku);
+  if (!product) return { found: false, sku, reason: `No SKU "${sku}" found in Stock Overview` };
+  return {
+    found: true,
+    sku,
+    batchLabel,
+    balance: product.balance,
+    requested: quantity,
+    fulfillable: product.balance >= quantity,
+    shortfall: Math.max(0, quantity - product.balance)
+  };
+}
+
+function columnIndexToLetter(index) {
+  let letter = '';
+  let n = index;
+  while (n >= 0) {
+    letter = String.fromCharCode('A'.charCodeAt(0) + (n % 26)) + letter;
+    n = Math.floor(n / 26) - 1;
+  }
+  return letter;
+}
+
+// Increments the "New Orders (Batch N)" cell for one SKU by `quantity`.
+// This is the one write into Stock Overview verified safe against the real
+// formula relationship above — it does NOT touch In Stock, the batch-
+// reserved column, Available, or Balance directly, since those are (or
+// behave like) live formulas that should recalculate on their own once
+// New Orders changes. Watch the first real write to confirm Balance
+// actually updates as expected before relying on this unattended.
+async function recordNewOrderAgainstBatch(sku, quantity) {
+  const { products, columns } = await getStockOverview();
+  const product = products.find((p) => p.sku === sku);
+  if (!product) throw new Error(`Cannot record order — no SKU "${sku}" found in Stock Overview.`);
+
+  const newOrdersColLetter = columnIndexToLetter(columns.newOrders);
+  const newValue = product.newOrders + quantity;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${STOCK_OVERVIEW_TAB}'!${newOrdersColLetter}${product.rowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[newValue]] }
+  });
+
+  return { sku, previousNewOrders: product.newOrders, addedQuantity: quantity, newNewOrders: newValue };
+}
+
+// ---------------------------------------------------------------------------
 // ADMIN ENDPOINTS
 //
 // Deliberately admin endpoints, not the only interface — the logic that
@@ -175,6 +288,38 @@ app.post('/admin/add-client', async (req, res) => {
   try {
     const result = await insertClientRow(tabName, rowValues);
     res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/stock-overview', async (_req, res) => {
+  try {
+    res.json(await getStockOverview());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/check-availability', async (req, res) => {
+  const { sku, quantity } = req.body;
+  if (!sku || !quantity) return res.status(400).json({ error: 'sku and quantity are required' });
+  try {
+    res.json(await checkStockAvailability(sku, Number(quantity)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Called by other agents (e.g. the Shopify-Xero agent) after a sale is
+// confirmed, to bump the current batch's "New Orders" count for a SKU.
+// Does not decide fulfillment strategy or touch batch tabs — just the one
+// verified-safe Stock Overview write.
+app.post('/admin/record-order', async (req, res) => {
+  const { sku, quantity } = req.body;
+  if (!sku || !quantity) return res.status(400).json({ error: 'sku and quantity are required' });
+  try {
+    res.json({ ok: true, ...(await recordNewOrderAgainstBatch(sku, Number(quantity))) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
