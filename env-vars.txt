@@ -35,4 +35,10 @@ SHEET_ID=
 # renamed the tab in the live sheet.
 STOCK_OVERVIEW_TAB=📦 Stock Overview
 
+# Tab this agent creates and owns itself for the "log sold deal / mark
+# order sent" tracking (added 2026-08-31) — separate from the real batch
+# tabs, since those aren't confirmed yet. Auto-created on first use if it
+# doesn't already exist, no manual setup needed.
+AUTOMATION_LOG_TAB=🤖 Automation Log
+
 PORT=3009

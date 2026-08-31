@@ -251,6 +251,128 @@ async function recordNewOrderAgainstBatch(sku, quantity) {
 }
 
 // ---------------------------------------------------------------------------
+// AUTOMATION LOG (added 2026-08-31) — a tab this agent fully owns and
+// creates itself, deliberately SEPARATE from the real batch tabs. Xavier
+// needs a working "log a sold deal / mark an order sent" tool now, but the
+// real batch-tab column layout is still unconfirmed — writing into an
+// unverified structure risks corrupting the actual ops sheet. This tab
+// sidesteps that entirely: known headers, plain append-only log, safe to
+// build without guessing anyone else's structure. Once the real batch tab
+// layout is confirmed, this can either become the permanent record, or a
+// sync step can copy entries from here into the correct batch tab — that
+// decision is deliberately deferred, not made here.
+// ---------------------------------------------------------------------------
+const AUTOMATION_LOG_TAB = process.env.AUTOMATION_LOG_TAB || '🤖 Automation Log';
+const AUTOMATION_LOG_HEADERS = [
+  'Order ID', 'Timestamp', 'Source', 'Customer Name', 'Email', 'SKU', 'Product',
+  'Quantity', 'Delivery Address', 'Deal Value', 'Stock Check', 'Deposit Status',
+  'Courier', 'Tracking #', 'Order Sent Date', 'Notes'
+];
+
+async function ensureAutomationLogTab() {
+  const sheetsMeta = await getSheetMeta();
+  const exists = sheetsMeta.some((s) => s.properties.title === AUTOMATION_LOG_TAB);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: AUTOMATION_LOG_TAB } } }] }
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${AUTOMATION_LOG_TAB}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [AUTOMATION_LOG_HEADERS] }
+  });
+}
+
+async function getAutomationLogRows() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SHEET_ID,
+    range: AUTOMATION_LOG_TAB
+  });
+  const rows = res.data.values ?? [];
+  const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim() === 'Order ID');
+  if (headerRowIdx === -1) return { headers: AUTOMATION_LOG_HEADERS, entries: [] };
+  const headers = rows[headerRowIdx];
+  const entries = rows.slice(headerRowIdx + 1)
+    .map((row, i) => ({ rowNumber: headerRowIdx + 2 + i, ...Object.fromEntries(headers.map((h, idx) => [h, row[idx] ?? ''])) }))
+    .filter((e) => e['Order ID']);
+  return { headers, entries };
+}
+
+async function logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes }) {
+  await ensureAutomationLogTab();
+
+  const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  let stockCheckNote = 'Not checked';
+  let productName = '';
+  if (sku && quantity) {
+    try {
+      const check = await checkStockAvailability(sku, Number(quantity));
+      if (check.found) {
+        stockCheckNote = check.fulfillable
+          ? `OK — ${check.balance} available (${check.batchLabel})`
+          : `SHORT by ${check.shortfall} — only ${check.balance} available (${check.batchLabel})`;
+        const overview = await getStockOverview();
+        productName = overview.products.find((p) => p.sku === sku)?.productName ?? '';
+      } else {
+        stockCheckNote = check.reason;
+      }
+    } catch (err) {
+      stockCheckNote = `Stock check failed: ${err.message}`;
+    }
+  }
+
+  const row = [
+    orderId,
+    new Date().toISOString(),
+    source || 'Manual',
+    customerName || '',
+    email || '',
+    sku || '',
+    productName,
+    quantity ?? '',
+    deliveryAddress || '',
+    dealValue ?? '',
+    stockCheckNote,
+    depositStatus || '',
+    '', '', '', // Courier, Tracking #, Order Sent Date — filled in later via markOrderSent
+    notes || ''
+  ];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${AUTOMATION_LOG_TAB}'!A:A`,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [row] }
+  });
+
+  return { orderId, stockCheck: stockCheckNote };
+}
+
+async function markOrderSent({ orderId, courier, trackingNumber, sentDate }) {
+  const { headers, entries } = await getAutomationLogRows();
+  const entry = entries.find((e) => e['Order ID'] === orderId);
+  if (!entry) throw new Error(`No Automation Log entry found for order ID "${orderId}"`);
+
+  // Courier, Tracking #, Order Sent Date are three consecutive columns in
+  // AUTOMATION_LOG_HEADERS, so a single contiguous range covers all three.
+  const courierCol = columnIndexToLetter(headers.indexOf('Courier'));
+  const sentDateCol = columnIndexToLetter(headers.indexOf('Order Sent Date'));
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${AUTOMATION_LOG_TAB}'!${courierCol}${entry.rowNumber}:${sentDateCol}${entry.rowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[courier || '', trackingNumber || '', sentDate || new Date().toISOString().slice(0, 10)]] }
+  });
+
+  return { orderId, courier, trackingNumber, sentDate };
+}
+
+// ---------------------------------------------------------------------------
 // ADMIN ENDPOINTS
 //
 // Deliberately admin endpoints, not the only interface — the logic that
@@ -320,6 +442,35 @@ app.post('/admin/record-order', async (req, res) => {
   if (!sku || !quantity) return res.status(400).json({ error: 'sku and quantity are required' });
   try {
     res.json({ ok: true, ...(await recordNewOrderAgainstBatch(sku, Number(quantity))) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/automation-log', async (_req, res) => {
+  try {
+    const { entries } = await getAutomationLogRows();
+    res.json({ entries });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/log-sold-deal', async (req, res) => {
+  const { source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes } = req.body;
+  if (!customerName) return res.status(400).json({ error: 'customerName is required' });
+  try {
+    res.json({ ok: true, ...(await logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/mark-order-sent', async (req, res) => {
+  const { orderId, courier, trackingNumber, sentDate } = req.body;
+  if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+  try {
+    res.json({ ok: true, ...(await markOrderSent({ orderId, courier, trackingNumber, sentDate })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -21,6 +21,25 @@ yet (see project memory). Wiring an automatic trigger is a separate, later
 step once that's worked out. For now, `/admin/add-client` is a manual/
 scripted call, not something firing on its own.
 
+## Automation Log — the working "log a sold deal / mark order sent" tool
+
+Added 2026-08-31, this is what actually backs the ops-console app. Unlike
+`/admin/add-client` above, this does NOT touch the real batch tabs — it
+writes into a tab this agent creates and owns itself ("🤖 Automation Log",
+auto-created on first use), specifically to avoid guessing at the
+unconfirmed batch-tab column layout. Safe to use today.
+
+- `POST /admin/log-sold-deal` — logs a new sold deal, runs a stock
+  availability check against Stock Overview (informational, not a hard
+  gate), generates an order ID.
+- `POST /admin/mark-order-sent` — fills in courier/tracking/sent-date for
+  an existing logged order, found by order ID.
+- `GET /admin/automation-log` — lists every logged entry.
+
+Once the real batch tab layout is confirmed, decide then whether this tab
+becomes the permanent record or a sync step copies entries into the real
+batch tabs — deliberately not decided yet.
+
 ## Not yet confirmed — verify against the REAL sheet before trusting this
 
 This was written from the sheet's documented structure (per the "How To
@@ -52,6 +71,9 @@ I don't have access to it yet. Before relying on this:
 - `GET /admin/read-tab?tabName=BATCH%2012` — raw rows for one tab.
 - `POST /admin/add-client` — body `{ "tabName": "BATCH 12", "rowValues": [...] }`,
   inserts a new client row above that tab's "↳ Remaining" row.
+- `POST /admin/log-sold-deal` — body `{ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes }`, only `customerName` required.
+- `POST /admin/mark-order-sent` — body `{ orderId, courier, trackingNumber, sentDate }`.
+- `GET /admin/automation-log` — lists all logged entries.
 
 ## Setup checklist
 
