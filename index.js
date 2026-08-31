@@ -6,6 +6,23 @@ const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
+// KEYED LOCK — added 2026-08-31 after an audit found recordNewOrderAgainstBatch
+// does a non-atomic read-modify-write (read New Orders, add quantity, write
+// back an absolute number) — two concurrent calls for the SAME SKU could
+// both read the same stale value and one increment would silently overwrite
+// the other, losing a real stock update. Serializes calls sharing a key
+// (here, per-SKU) within this process — different SKUs still run in
+// parallel since they touch different cells.
+// ---------------------------------------------------------------------------
+const locks = new Map();
+function withLock(key, fn) {
+  const prevTail = locks.get(key) || Promise.resolve();
+  const run = prevTail.then(fn, fn);
+  locks.set(key, run.then(() => {}, () => {}));
+  return run;
+}
+
+// ---------------------------------------------------------------------------
 // AUTH — shared-secret pattern, same as every other agent in this project.
 // /oauth/* stays exempt, same reasoning as the other Google/Xero agents.
 // ---------------------------------------------------------------------------
@@ -216,7 +233,13 @@ async function checkStockAvailability(sku, quantity) {
   };
 }
 
+// Guards -1 explicitly (audit 2026-08-31): every caller passes the result
+// of headers.indexOf(...), and a missing/renamed column previously
+// produced columnIndexToLetter(-1) === '' silently — turning a targeted
+// single-cell write into a malformed, row-only A1 range that could
+// overwrite the WRONG columns (e.g. Order ID) instead of failing loudly.
 function columnIndexToLetter(index) {
+  if (index < 0) throw new Error(`columnIndexToLetter: no such column (index ${index}) — a header may have been renamed or is missing from the sheet.`);
   let letter = '';
   let n = index;
   while (n >= 0) {
@@ -233,7 +256,18 @@ function columnIndexToLetter(index) {
 // behave like) live formulas that should recalculate on their own once
 // New Orders changes. Watch the first real write to confirm Balance
 // actually updates as expected before relying on this unattended.
+//
+// Locked per-SKU (audit 2026-08-31) — this is a read-modify-write (read
+// the current count, add quantity, write back an absolute number, not a
+// Sheets formula increment). Two concurrent calls for the same SKU could
+// otherwise both read the same stale value and the second write would
+// silently clobber the first, losing a real stock update with no error.
+// Different SKUs still run concurrently since they touch different cells.
 async function recordNewOrderAgainstBatch(sku, quantity) {
+  return withLock(`stock:${sku}`, () => recordNewOrderAgainstBatchLocked(sku, quantity));
+}
+
+async function recordNewOrderAgainstBatchLocked(sku, quantity) {
   const { products, columns } = await getStockOverview();
   const product = products.find((p) => p.sku === sku);
   if (!product) throw new Error(`Cannot record order — no SKU "${sku}" found in Stock Overview.`);
@@ -620,10 +654,23 @@ app.post('/admin/log-sold-deal', async (req, res) => {
 
 // Called once the final 50% invoice has been created (by pipely-xero-agent,
 // via externalRef) or by ops directly (via orderId).
+//
+// Deliberately refuses status:"Paid" here (audit 2026-08-31) — this
+// endpoint exists for pipely-xero-agent to record "Invoiced" right after
+// it actually creates a real Xero invoice, not as a general-purpose status
+// setter. Without this restriction, any caller holding this service's
+// shared API key could POST status:"Paid" directly with no real invoice
+// or payment behind it, satisfying assertReadyToShip's release gate for
+// an order that was never actually paid. "Paid" is only reachable through
+// /admin/mark-final-payment-received below, which is the one deliberate,
+// named action a human takes after confirming payment in Xero themselves.
 app.post('/admin/set-final-payment-status', async (req, res) => {
   const { orderId, externalRef, status } = req.body;
   if ((!orderId && !externalRef) || !status) {
     return res.status(400).json({ error: 'orderId or externalRef, and status, are required' });
+  }
+  if (status === 'Paid') {
+    return res.status(400).json({ error: 'Cannot set status "Paid" through this endpoint — call /admin/mark-final-payment-received instead, after confirming payment in Xero.' });
   }
   try {
     res.json({ ok: true, ...(await setFinalPaymentStatus({ orderId, externalRef, status })) });

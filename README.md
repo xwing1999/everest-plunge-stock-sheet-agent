@@ -4,6 +4,15 @@ Automates writes to Everest Plunge's stock & fulfillment Google Sheet (the
 per-batch client allocation tracker — batch tabs like "BATCH 12", each with
 a product anchor row and stacked client rows above a "↳ Remaining" row).
 
+**2026-08-31 — audit fixes**: `recordNewOrderAgainstBatch` is now locked
+per-SKU (was a non-atomic read-modify-write that could silently lose an
+increment under concurrent calls), `/admin/set-final-payment-status`
+refuses `status:"Paid"` (that value is only reachable via
+`/admin/mark-final-payment-received`, closing a gap where any caller with
+the API key could satisfy the release gate with no real payment behind
+it), and `columnIndexToLetter` now throws on a missing/renamed column
+instead of silently producing a malformed write range.
+
 ## What this agent actually does right now
 
 This is the **mechanism**, not the full automation. It provides:
