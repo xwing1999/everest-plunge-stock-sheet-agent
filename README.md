@@ -34,11 +34,37 @@ unconfirmed batch-tab column layout. Safe to use today.
   gate), generates an order ID.
 - `POST /admin/mark-order-sent` — fills in courier/tracking/sent-date for
   an existing logged order, found by order ID.
-- `GET /admin/automation-log` — lists every logged entry.
+- `GET /admin/automation-log` — lists every logged entry, with a computed
+  `Status` (Ready to organise / Awaiting stock (on water) / Awaiting stock
+  (not yet ordered) / Sent) derived from Allocation + Order Sent Date.
 
 Once the real batch tab layout is confirmed, decide then whether this tab
 becomes the permanent record or a sync step copies entries into the real
 batch tabs — deliberately not decided yet.
+
+## Stock allocation model (added 2026-08-31)
+
+Xavier's 4-bucket model for every sold deal: **On Shore** (ships now),
+**On Water** (claimed against a named incoming batch), **Next Custom
+Order** (nothing covers it yet — goes in the next China order). A person
+picks the bucket when logging the deal (`allocation` field on
+`/admin/log-sold-deal`), informed by the live balance already shown in the
+ops console — deliberately NOT an automatic waterfall algorithm, which
+risks getting concurrent claims against limited stock wrong in a way a
+human glancing at the real number won't.
+
+- `POST /admin/mark-batch-arrived` — body `{ batchReference }`. Flips
+  every deal allocated to that batch from "On Water" to "On Shore" in one
+  move — Xavier: "everyone already allocated to that stock needs to be
+  organised." Does **not** touch Stock Overview's physical In Stock count
+  or the current-batch column rollover ("Batch 10" → "Batch 11" in that
+  tab's own headers) — that needs a real arrival manifest and a confirmed
+  rollover process, not a guess. Stays manual in Stock Overview for now.
+- `GET /admin/products-to-order` — bucket 4, computed rather than
+  hand-maintained: every un-ordered "Next Custom Order" deal, grouped by
+  SKU with summed quantities. The live shopping list for the next order.
+- `POST /admin/mark-order-placed` — body `{ orderId }`. Marks one deal's
+  stock as ordered, dropping it out of the products-to-order list.
 
 ## Not yet confirmed — verify against the REAL sheet before trusting this
 
@@ -71,9 +97,12 @@ I don't have access to it yet. Before relying on this:
 - `GET /admin/read-tab?tabName=BATCH%2012` — raw rows for one tab.
 - `POST /admin/add-client` — body `{ "tabName": "BATCH 12", "rowValues": [...] }`,
   inserts a new client row above that tab's "↳ Remaining" row.
-- `POST /admin/log-sold-deal` — body `{ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes }`, only `customerName` required.
+- `POST /admin/log-sold-deal` — body `{ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes }`, only `customerName` required. `allocation` should be one of `On Shore` / `On Water` / `Next Custom Order`; `batchReference` only matters when allocation is `On Water`.
 - `POST /admin/mark-order-sent` — body `{ orderId, courier, trackingNumber, sentDate }`.
-- `GET /admin/automation-log` — lists all logged entries.
+- `GET /admin/automation-log` — lists all logged entries with computed `Status`.
+- `POST /admin/mark-batch-arrived` — body `{ batchReference }`.
+- `GET /admin/products-to-order` — bucket-4 shopping list, grouped by SKU.
+- `POST /admin/mark-order-placed` — body `{ orderId }`.
 
 ## Setup checklist
 

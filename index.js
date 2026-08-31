@@ -263,9 +263,19 @@ async function recordNewOrderAgainstBatch(sku, quantity) {
 // decision is deliberately deferred, not made here.
 // ---------------------------------------------------------------------------
 const AUTOMATION_LOG_TAB = process.env.AUTOMATION_LOG_TAB || '🤖 Automation Log';
+// Allocation / Batch Reference / Expected Date / Order Placed added
+// 2026-08-31 — Xavier's 4-bucket stock model: every sold deal is claimed
+// against On Shore stock, an On Water incoming batch, or falls to Next
+// Custom Order (not yet placed with the manufacturer). Deliberately a
+// field a HUMAN sets when logging the deal (informed by the live Stock
+// Overview balance already shown in the ops console), not an automatic
+// waterfall — an automatic allocation engine risks getting concurrent
+// claims against the same limited stock wrong, which a person glancing at
+// the real number does not.
 const AUTOMATION_LOG_HEADERS = [
   'Order ID', 'Timestamp', 'Source', 'Customer Name', 'Email', 'SKU', 'Product',
   'Quantity', 'Delivery Address', 'Deal Value', 'Stock Check', 'Deposit Status',
+  'Allocation', 'Batch Reference', 'Expected Date', 'Order Placed',
   'Courier', 'Tracking #', 'Order Sent Date', 'Notes'
 ];
 
@@ -301,7 +311,7 @@ async function getAutomationLogRows() {
   return { headers, entries };
 }
 
-async function logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes }) {
+async function logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes }) {
   await ensureAutomationLogTab();
 
   const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -337,6 +347,10 @@ async function logSoldDeal({ source, customerName, email, sku, quantity, deliver
     dealValue ?? '',
     stockCheckNote,
     depositStatus || '',
+    allocation || '',
+    batchReference || '',
+    expectedDate || '',
+    '', // Order Placed — only meaningful for Next Custom Order rows, see markOrderPlaced
     '', '', '', // Courier, Tracking #, Order Sent Date — filled in later via markOrderSent
     notes || ''
   ];
@@ -370,6 +384,83 @@ async function markOrderSent({ orderId, courier, trackingNumber, sentDate }) {
   });
 
   return { orderId, courier, trackingNumber, sentDate };
+}
+
+// Not stored — computed from Allocation + Order Sent Date so it can't
+// drift out of sync with them.
+function deriveOrderStatus(entry) {
+  if (entry['Order Sent Date']) return 'Sent';
+  if (entry['Allocation'] === 'On Shore') return 'Ready to organise';
+  if (entry['Allocation'] === 'On Water') return 'Awaiting stock (on water)';
+  if (entry['Allocation'] === 'Next Custom Order') return 'Awaiting stock (not yet ordered)';
+  return 'Unallocated';
+}
+
+// ---------------------------------------------------------------------------
+// BATCH ARRIVAL — when a shipment lands, every deal that was allocated
+// against it needs to flip from "waiting" to "ready to organise" in one
+// move, per Xavier: "everyone already allocated to that stock needs to be
+// organised." Only flips the Allocation tracking in the Automation Log —
+// deliberately does NOT touch Stock Overview's physical In Stock count or
+// the current-batch column rollover (e.g. "Batch 10" -> "Batch 11" in that
+// tab's own headers). That needs a real arrival manifest (exact per-SKU
+// quantities, not just what's already allocated to specific deals) and a
+// confirmed process for the column rollover — guessing either risks the
+// live stock formulas. Stays a manual step in Stock Overview for now.
+// ---------------------------------------------------------------------------
+async function markBatchArrived(batchReference) {
+  const { headers, entries } = await getAutomationLogRows();
+  const allocationCol = columnIndexToLetter(headers.indexOf('Allocation'));
+  const matching = entries.filter((e) => e['Allocation'] === 'On Water' && e['Batch Reference'] === batchReference);
+
+  for (const entry of matching) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `'${AUTOMATION_LOG_TAB}'!${allocationCol}${entry.rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [['On Shore']] }
+    });
+  }
+
+  return {
+    batchReference,
+    flippedCount: matching.length,
+    flipped: matching.map((e) => ({ orderId: e['Order ID'], customerName: e['Customer Name'], sku: e['SKU'], quantity: e['Quantity'] }))
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PRODUCTS TO ORDER — bucket 4 of Xavier's model, computed rather than
+// hand-maintained: every "Next Custom Order" deal not yet marked ordered,
+// grouped by SKU. This is the live shopping list for the next China order.
+// ---------------------------------------------------------------------------
+async function getProductsToOrder() {
+  const { entries } = await getAutomationLogRows();
+  const pending = entries.filter((e) => e['Allocation'] === 'Next Custom Order' && !e['Order Placed']);
+
+  const bySku = {};
+  for (const e of pending) {
+    const sku = e['SKU'] || '(no SKU)';
+    if (!bySku[sku]) bySku[sku] = { sku, product: e['Product'] || '', totalQuantity: 0, orderIds: [] };
+    bySku[sku].totalQuantity += Number(e['Quantity'] || 0);
+    bySku[sku].orderIds.push(e['Order ID']);
+  }
+  return Object.values(bySku);
+}
+
+async function markOrderPlaced(orderId) {
+  const { headers, entries } = await getAutomationLogRows();
+  const entry = entries.find((e) => e['Order ID'] === orderId);
+  if (!entry) throw new Error(`No Automation Log entry found for order ID "${orderId}"`);
+
+  const col = columnIndexToLetter(headers.indexOf('Order Placed'));
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${AUTOMATION_LOG_TAB}'!${col}${entry.rowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [['TRUE']] }
+  });
+  return { orderId };
 }
 
 // ---------------------------------------------------------------------------
@@ -450,17 +541,17 @@ app.post('/admin/record-order', async (req, res) => {
 app.get('/admin/automation-log', async (_req, res) => {
   try {
     const { entries } = await getAutomationLogRows();
-    res.json({ entries });
+    res.json({ entries: entries.map((e) => ({ ...e, Status: deriveOrderStatus(e) })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/admin/log-sold-deal', async (req, res) => {
-  const { source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes } = req.body;
+  const { source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes } = req.body;
   if (!customerName) return res.status(400).json({ error: 'customerName is required' });
   try {
-    res.json({ ok: true, ...(await logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, notes })) });
+    res.json({ ok: true, ...(await logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -471,6 +562,37 @@ app.post('/admin/mark-order-sent', async (req, res) => {
   if (!orderId) return res.status(400).json({ error: 'orderId is required' });
   try {
     res.json({ ok: true, ...(await markOrderSent({ orderId, courier, trackingNumber, sentDate })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Flips every deal allocated against an incoming batch to "ready to
+// organise" once it's physically landed. Does NOT touch Stock Overview's
+// In Stock count — see the comment above markBatchArrived for why.
+app.post('/admin/mark-batch-arrived', async (req, res) => {
+  const { batchReference } = req.body;
+  if (!batchReference) return res.status(400).json({ error: 'batchReference is required' });
+  try {
+    res.json({ ok: true, ...(await markBatchArrived(batchReference)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/products-to-order', async (_req, res) => {
+  try {
+    res.json({ products: await getProductsToOrder() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/mark-order-placed', async (req, res) => {
+  const { orderId } = req.body;
+  if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+  try {
+    res.json({ ok: true, ...(await markOrderPlaced(orderId)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
