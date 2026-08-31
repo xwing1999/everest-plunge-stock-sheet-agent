@@ -272,9 +272,15 @@ const AUTOMATION_LOG_TAB = process.env.AUTOMATION_LOG_TAB || '🤖 Automation Lo
 // waterfall — an automatic allocation engine risks getting concurrent
 // claims against the same limited stock wrong, which a person glancing at
 // the real number does not.
+// External Ref / Final Payment Status / Ship Target Date added 2026-08-31
+// alongside the final-payment release gate — External Ref lets another
+// agent (e.g. pipely-xero-agent, which only knows a Pipely opportunity ID,
+// not this tab's generated Order ID) look an entry up reliably instead of
+// parsing it out of free-text Notes.
 const AUTOMATION_LOG_HEADERS = [
-  'Order ID', 'Timestamp', 'Source', 'Customer Name', 'Email', 'SKU', 'Product',
+  'Order ID', 'External Ref', 'Timestamp', 'Source', 'Customer Name', 'Email', 'SKU', 'Product',
   'Quantity', 'Delivery Address', 'Deal Value', 'Stock Check', 'Deposit Status',
+  'Final Payment Status', 'Ship Target Date',
   'Allocation', 'Batch Reference', 'Expected Date', 'Order Placed',
   'Courier', 'Tracking #', 'Order Sent Date', 'Notes'
 ];
@@ -311,7 +317,7 @@ async function getAutomationLogRows() {
   return { headers, entries };
 }
 
-async function logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes }) {
+async function logSoldDeal({ source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
   await ensureAutomationLogTab();
 
   const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -336,6 +342,7 @@ async function logSoldDeal({ source, customerName, email, sku, quantity, deliver
 
   const row = [
     orderId,
+    externalRef || '',
     new Date().toISOString(),
     source || 'Manual',
     customerName || '',
@@ -347,6 +354,8 @@ async function logSoldDeal({ source, customerName, email, sku, quantity, deliver
     dealValue ?? '',
     stockCheckNote,
     depositStatus || '',
+    finalPaymentStatus || '',
+    shipTargetDate || '',
     allocation || '',
     batchReference || '',
     expectedDate || '',
@@ -366,10 +375,27 @@ async function logSoldDeal({ source, customerName, email, sku, quantity, deliver
   return { orderId, stockCheck: stockCheckNote };
 }
 
+// RELEASE GATE — Xavier: the final 50% "must be paid before sending the
+// product," no exceptions. Enforced here, not just in the UI, so it can't
+// be bypassed by calling this endpoint directly. Shopify orders skip the
+// gate entirely — they're paid in full at checkout (Deposit Status is set
+// to "Paid in full" by shopify-xero-agent), there's no final payment step
+// for them to wait on.
+function assertReadyToShip(entry) {
+  if (entry['Deposit Status'] === 'Paid in full') return;
+  if (entry['Final Payment Status'] === 'Paid') return;
+  throw new Error(
+    `Order ${entry['Order ID']} cannot be marked sent — final payment is not confirmed paid ` +
+    `(current status: "${entry['Final Payment Status'] || 'not invoiced'}"). ` +
+    `Confirm payment in Xero, then call /admin/mark-final-payment-received first.`
+  );
+}
+
 async function markOrderSent({ orderId, courier, trackingNumber, sentDate }) {
   const { headers, entries } = await getAutomationLogRows();
   const entry = entries.find((e) => e['Order ID'] === orderId);
   if (!entry) throw new Error(`No Automation Log entry found for order ID "${orderId}"`);
+  assertReadyToShip(entry);
 
   // Courier, Tracking #, Order Sent Date are three consecutive columns in
   // AUTOMATION_LOG_HEADERS, so a single contiguous range covers all three.
@@ -384,6 +410,32 @@ async function markOrderSent({ orderId, courier, trackingNumber, sentDate }) {
   });
 
   return { orderId, courier, trackingNumber, sentDate };
+}
+
+// Finds an entry (and its row) by either key — orderId (what the ops
+// console knows) or externalRef (what pipely-xero-agent knows: the Pipely
+// opportunity ID, not this tab's generated Order ID). Takes the already-
+// fetched {headers, entries} rather than re-fetching, since callers
+// usually need both the lookup and the headers/column positions anyway.
+function findAutomationLogEntry({ entries }, { orderId, externalRef }) {
+  const entry = orderId
+    ? entries.find((e) => e['Order ID'] === orderId)
+    : entries.find((e) => e['External Ref'] === externalRef);
+  if (!entry) throw new Error(`No Automation Log entry found for ${orderId ? `order ID "${orderId}"` : `external ref "${externalRef}"`}`);
+  return entry;
+}
+
+async function setFinalPaymentStatus({ orderId, externalRef, status }) {
+  const log = await getAutomationLogRows();
+  const entry = findAutomationLogEntry(log, { orderId, externalRef });
+  const col = columnIndexToLetter(log.headers.indexOf('Final Payment Status'));
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${AUTOMATION_LOG_TAB}'!${col}${entry.rowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[status]] }
+  });
+  return { orderId: entry['Order ID'], status };
 }
 
 // Not stored — computed from Allocation + Order Sent Date so it can't
@@ -548,10 +600,43 @@ app.get('/admin/automation-log', async (_req, res) => {
 });
 
 app.post('/admin/log-sold-deal', async (req, res) => {
-  const { source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes } = req.body;
+  const {
+    source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
+    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes
+  } = req.body;
   if (!customerName) return res.status(400).json({ error: 'customerName is required' });
   try {
-    res.json({ ok: true, ...(await logSoldDeal({ source, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, allocation, batchReference, expectedDate, notes })) });
+    res.json({
+      ok: true,
+      ...(await logSoldDeal({
+        source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
+        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Called once the final 50% invoice has been created (by pipely-xero-agent,
+// via externalRef) or by ops directly (via orderId).
+app.post('/admin/set-final-payment-status', async (req, res) => {
+  const { orderId, externalRef, status } = req.body;
+  if ((!orderId && !externalRef) || !status) {
+    return res.status(400).json({ error: 'orderId or externalRef, and status, are required' });
+  }
+  try {
+    res.json({ ok: true, ...(await setFinalPaymentStatus({ orderId, externalRef, status })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/mark-final-payment-received', async (req, res) => {
+  const { orderId, externalRef } = req.body;
+  if (!orderId && !externalRef) return res.status(400).json({ error: 'orderId or externalRef is required' });
+  try {
+    res.json({ ok: true, ...(await setFinalPaymentStatus({ orderId, externalRef, status: 'Paid' })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
