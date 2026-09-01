@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import { google } from 'googleapis';
+import fs from 'fs';
+import path from 'path';
 
 const app = express();
 app.use(express.json());
@@ -472,6 +474,48 @@ async function setFinalPaymentStatus({ orderId, externalRef, status }) {
   return { orderId: entry['Order ID'], status };
 }
 
+// ---------------------------------------------------------------------------
+// BATCH ETA / COUNTDOWN (added 2026-09-01) — Xavier's countdown-to-shore
+// model, corrected same day from an initial per-ORDER design to per-BATCH
+// (shipment): "I want a countdown on orders arriving to shores from their
+// container boats" — matches the real spreadsheet's own structure, where
+// each batch tab has a single shared "ETA:" field in its info strip
+// (Shipment: BATCH-12 | ETA: ... | Route: ... | Status: ...), not a
+// per-client date. Every order allocated to that batch (via the
+// Automation Log's existing "Batch Reference" field) shares one ETA.
+//
+// Deliberately NOT read from/written into the real batch tabs themselves
+// (e.g. "BATCH 12") — this agent has no parsing logic for those yet (their
+// real layout — anchor rows, client rows, the "↳ Remaining" row — isn't
+// something this code understands), and guessing at cell positions there
+// risks corrupting a manually-maintained sheet. Kept as this agent's own
+// small persisted store instead, keyed by Batch Reference (the same
+// string already used to link orders to shipments), same "capture what we
+// have" pattern as the Automation Log itself. Real Mainfreight tracking
+// integration isn't confirmed yet, so this stays human-entered, not
+// pulled automatically — see project notes.
+// ---------------------------------------------------------------------------
+const BATCH_ETAS_FILE = process.env.BATCH_ETAS_FILE || '/data/batch-etas.json';
+
+function loadBatchEtas() {
+  try { return JSON.parse(fs.readFileSync(BATCH_ETAS_FILE, 'utf8')); } catch { return {}; }
+}
+function saveBatchEtas(map) {
+  try {
+    fs.mkdirSync(path.dirname(BATCH_ETAS_FILE), { recursive: true });
+    fs.writeFileSync(BATCH_ETAS_FILE, JSON.stringify(map, null, 2));
+  } catch (err) {
+    console.warn('Could not persist batch ETAs to disk:', err.message);
+  }
+}
+
+function setBatchEta(batchReference, date) {
+  const map = loadBatchEtas();
+  map[batchReference] = { eta: date, updatedAt: new Date().toISOString() };
+  saveBatchEtas(map);
+  return { batchReference, eta: date };
+}
+
 // Not stored — computed from Allocation + Order Sent Date so it can't
 // drift out of sync with them.
 function deriveOrderStatus(entry) {
@@ -627,7 +671,19 @@ app.post('/admin/record-order', async (req, res) => {
 app.get('/admin/automation-log', async (_req, res) => {
   try {
     const { entries } = await getAutomationLogRows();
-    res.json({ entries: entries.map((e) => ({ ...e, Status: deriveOrderStatus(e) })) });
+    const batchEtas = loadBatchEtas();
+    res.json({
+      entries: entries.map((e) => ({
+        ...e,
+        Status: deriveOrderStatus(e),
+        // Computed, not a real sheet column — resolved from the batch ETA
+        // store by "Batch Reference", the same key that already links an
+        // order to its shipment. Consumers (ops console, pipely-xero-
+        // agent's final-invoice sweep) read this one field rather than
+        // each re-implementing the lookup.
+        'Ship ETA': batchEtas[e['Batch Reference']]?.eta ?? null
+      }))
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -687,6 +743,22 @@ app.post('/admin/mark-final-payment-received', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/admin/set-batch-eta', (req, res) => {
+  const { batchReference, date } = req.body;
+  if (!batchReference || !date) {
+    return res.status(400).json({ error: 'batchReference and date are required' });
+  }
+  try {
+    res.json({ ok: true, ...setBatchEta(batchReference, date) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/batch-etas', (_req, res) => {
+  res.json({ batchEtas: loadBatchEtas() });
 });
 
 app.post('/admin/mark-order-sent', async (req, res) => {

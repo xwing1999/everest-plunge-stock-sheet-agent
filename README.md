@@ -75,6 +75,65 @@ human glancing at the real number won't.
 - `POST /admin/mark-order-placed` — body `{ orderId }`. Marks one deal's
   stock as ordered, dropping it out of the products-to-order list.
 
+## Batch ETA / Countdown (added 2026-09-01)
+
+Xavier's countdown-to-shore model, replacing an earlier "ship date lives
+somewhere unconfirmed" blocker: one arrival ETA per **batch/shipment**
+(not per order) — matches how the real spreadsheet already tracks it
+(each batch tab has one shared "ETA:" field in its info strip). Ops sets
+it once per batch; every order allocated to that batch inherits the same
+countdown via its existing "Batch Reference" field. `pipely-xero-agent`
+polls this to fire the final 50% invoice automatically once a batch is
+within its lead-time window — see that agent's README.
+
+- `POST /admin/set-batch-eta` — body `{ batchReference, date }` (ISO
+  `YYYY-MM-DD`). Not validated beyond non-empty — this agent doesn't know
+  what "valid" means for a date any better than the caller does.
+- `GET /admin/batch-etas` — every batch's current ETA + when it was last
+  set.
+- `GET /admin/automation-log` now includes a computed `Ship ETA` field per
+  entry (not a real sheet column — resolved from the batch ETA store by
+  "Batch Reference"), so consumers don't need to do their own join.
+
+Deliberately NOT read from/written into the real batch tabs' own "ETA:"
+cell — this agent has no parsing logic for those tabs' real layout yet
+(see "Confirmed against the real spreadsheet" below), and guessing at
+cell positions risks corrupting a manually-maintained sheet. Kept as this
+agent's own small persisted store instead.
+
+## Confirmed against the real spreadsheet (2026-09-01)
+
+Inspected `Everest Plunge_Operations_v2.xlsx` directly (16 tabs). Real
+findings, correcting/confirming earlier notes:
+
+- **Real SKU catalog** (Stock Overview tab): SKU-001/002 Obsidian Sauna
+  2/4 Person ($5,490/$7,990), SKU-003/004 Onyx Sauna 2/4 Person
+  ($5,490/$7,990), SKU-005/006 Redlight Sauna 2/4 Person
+  ($5,990/$7,990), SKU-007 Sienna Sauna 4 Person Black ($10,990,
+  "Premium"). Two unlisted-SKU lines also appear in Master Order List:
+  Traditional Sauna 5-6/7-8 Person.
+- **Vulcan Sauna (White Aluminium) is real and active** — appears in real
+  BATCH 12 invoice rows (Noel McGirr, $7,675 deposit, paid). Earlier
+  memory guessed it might be discontinued since it didn't appear in an
+  older CSV snapshot — that guess was wrong, don't repeat it.
+- **Real batch tab structure** (BATCH 12 inspected directly): simpler
+  than the "How To Use" tab's anchor-row/remaining-row description
+  suggests in practice — real rows are closer to a flat invoice ledger
+  (Invoice No. | Invoice Date | Customer Name | Product | Batch label |
+  Invoice Amount | Invoice Type | Status), with extra detail (interior
+  notes, freight cost) stacked as extra rows under just the Product
+  column. The anchor/remaining structure may still exist elsewhere in the
+  tab (not fully mapped) — don't assume the simpler ledger view is the
+  complete picture.
+- **Each batch tab has its own ETA field** in row 3 ("Shipment: BATCH-12
+  | ETA: TBC | Route: TBC | Status: Pending") — this is what the Batch
+  ETA feature above is modeled on, kept as a separate store rather than
+  read/written directly (see above for why).
+- **`STOCK_OVERVIEW_TAB` env var default ("📦 Stock Overview") does not
+  exactly match either real tab name** in this workbook ("📦 Stock
+  Overview_13.08.2026" and "📦 Stock Overview_XW") — verify the actual
+  live Google Sheet's tab name before deploying; this may need updating.
+
 ## Not yet confirmed — verify against the REAL sheet before trusting this
 
 This was written from the sheet's documented structure (per the "How To
