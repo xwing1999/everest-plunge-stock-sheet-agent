@@ -101,6 +101,30 @@ cell — this agent has no parsing logic for those tabs' real layout yet
 cell positions risks corrupting a manually-maintained sheet. Kept as this
 agent's own small persisted store instead.
 
+## Fixed: Available/Balance were undercounting real reservations (2026-09-01)
+
+Confirmed live against the real deployed sheet (`Stock Overview_13.08.2026`
+— Xavier confirmed this is the real, currently-used tab; the sheet's own
+condition is rough — "our sheet is shit atm" — so treat every number as
+only as good as what's actually typed into it). The sheet has grown
+multiple "Batch N" reservation columns over time (Batch 10, 11, 12 all
+present at once) plus more than one "New Order(s)" column, but the tab's
+own Available/Balance formula cells were only ever wired to the FIRST
+batch column and never updated as later batch columns were added — real
+example: SKU-002 has 15 in stock, 5 reserved against Batch 10 AND 4 more
+against Batch 11 (9 total), so real availability is 6, but the sheet's own
+"Available" cell still shows 10 (just 15-5, silently ignoring Batch 11).
+
+`getStockOverview()` now sums EVERY matching "Batch N" and "New Order(s)"
+column instead of just the first, and computes Available/Balance itself
+rather than trusting the sheet's stale single-batch formula cells (still
+returned as `sheetAvailable`/`sheetBalance` per product, for comparison —
+nothing in this codebase should use those two over the computed values).
+`recordNewOrderAgainstBatch` still writes to only the first "New
+Order(s)" column found, unchanged — the sheet has no way to know which
+specific batch a brand-new sale should count against, so this doesn't
+guess.
+
 ## Confirmed against the real spreadsheet (2026-09-01)
 
 Inspected `Everest Plunge_Operations_v2.xlsx` directly (16 tabs). Real

@@ -162,15 +162,34 @@ async function insertClientRow(tabName, rowValues) {
 // logic above which is still written from the sheet's documented structure
 // only. Confirmed real layout:
 //   SKU | Product Name | Model / Size | In Stock | Batch N | Available |
-//   New Orders (Batch N) | Balance | Retail Price (NZD) | Warehouse | Notes
+//   New Orders (Batch N) | Balance | Batch N+1 | Batch N+2 | New Order |
+//   Retail Price (NZD) | Warehouse | Notes
 // The batch number is baked into the column HEADER TEXT itself ("Batch 10",
 // "New Orders (Batch 10)") and shifts every time a new batch cycle starts —
 // so columns are found by pattern match on each read, never by a fixed
-// name or index. Verified from real numbers that Available = In Stock -
-// Batch N, and Balance = Available - New Orders (Batch N); e.g. SKU-002:
-// 15 - 5 = 10 available, 10 - 2 = 8 balance. Treated as a live formula
-// relationship, matching the tab's own header note ("'Available'
-// auto-calculates").
+// name or index.
+//
+// CORRECTED 2026-09-01 — Xavier: "the overview just reflects the different
+// batches etc along the bottom of the sheet, all the sub headings just
+// need to combine." Confirmed against real live data: the sheet has grown
+// MULTIPLE "Batch N" reservation columns over time (Batch 10, 11, 12 all
+// present simultaneously) plus more than one "New Order(s)" column, but
+// the tab's own "Available"/"Balance" formula cells were only ever written
+// to account for the FIRST batch column — they don't get updated as new
+// batch columns are added. Real example proving this (SKU-002): In Stock
+// 15, Batch 10 = 5, Batch 11 = 4 — actually available is 15-5-4=6, but the
+// sheet's own "Available" cell still shows 10 (just 15-5, ignoring Batch
+// 11 entirely). Trusting the sheet's own Available/Balance cells directly
+// (the previous behavior of this function) meant every SKU with stock
+// reserved against more than one open batch showed as having MORE stock
+// to sell than actually exists.
+//
+// Fixed by finding EVERY column matching the batch/new-order patterns (not
+// just the first) and summing them — Available and Balance are now
+// computed here, not read from the sheet's stale single-batch formula
+// cells. The sheet's own Available/Balance are still read back as
+// `sheetAvailable`/`sheetBalance` for comparison/debugging, but nothing
+// in this codebase should trust those two over the computed values.
 // ---------------------------------------------------------------------------
 const STOCK_OVERVIEW_TAB = process.env.STOCK_OVERVIEW_TAB || '📦 Stock Overview';
 
@@ -185,37 +204,63 @@ async function getStockOverview() {
   if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${STOCK_OVERVIEW_TAB}".`);
   const headers = rows[headerRowIdx].map((h) => (h ?? '').toString().trim());
 
-  const col = {
+  const singleCol = {
     sku: headers.findIndex((h) => h.toUpperCase() === 'SKU'),
     productName: headers.findIndex((h) => h.toUpperCase() === 'PRODUCT NAME'),
     modelSize: headers.findIndex((h) => h.toUpperCase().startsWith('MODEL')),
     inStock: headers.findIndex((h) => h.toUpperCase() === 'IN STOCK'),
-    reserved: headers.findIndex((h) => /^batch\s*\d+$/i.test(h)),
+    // Kept only for the sheetAvailable/sheetBalance comparison fields below
+    // — not used for the real computed available/balance.
     available: headers.findIndex((h) => h.toUpperCase() === 'AVAILABLE'),
-    newOrders: headers.findIndex((h) => /^new orders\s*\(batch\s*\d+\)$/i.test(h)),
     balance: headers.findIndex((h) => h.toUpperCase() === 'BALANCE')
   };
-  const missing = Object.entries(col).filter(([, idx]) => idx === -1).map(([name]) => name);
+  const missing = Object.entries(singleCol).filter(([, idx]) => idx === -1).map(([name]) => name);
   if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}. Sheet structure may have changed — check "${STOCK_OVERVIEW_TAB}" by eye before trusting this.`);
 
-  const batchLabel = headers[col.reserved];
+  // Every batch-reservation and new-order column, not just the first —
+  // this is the actual fix. "New Order" (no batch number, no parentheses)
+  // is real data-entry inconsistency in the live sheet, not a different
+  // concept — matched loosely on purpose.
+  const batchCols = headers.map((h, i) => ({ h, i })).filter(({ h }) => /^batch\s*\d+$/i.test(h)).map(({ i }) => i);
+  const newOrderCols = headers.map((h, i) => ({ h, i })).filter(({ h }) => /^new orders?\b/i.test(h)).map(({ i }) => i);
+  if (!batchCols.length) throw new Error(`Stock Overview header row has no "Batch N" column(s) — sheet structure may have changed.`);
+
+  const batchLabel = batchCols.map((i) => headers[i]).join(' + ');
+  const sumCols = (row, cols) => cols.reduce((sum, i) => sum + Number(row[i] || 0), 0);
+
   const products = [];
   for (let r = headerRowIdx + 1; r < rows.length; r++) {
     const row = rows[r];
-    const sku = (row[col.sku] ?? '').toString().trim();
+    const sku = (row[singleCol.sku] ?? '').toString().trim();
     if (!sku || sku.toUpperCase() === 'TOTALS') break;
+
+    const inStock = Number(row[singleCol.inStock] || 0);
+    const reserved = sumCols(row, batchCols);
+    const newOrders = sumCols(row, newOrderCols);
+    const available = inStock - reserved;
+    const balance = available - newOrders;
+
     products.push({
       sku,
-      productName: row[col.productName] ?? '',
-      modelSize: row[col.modelSize] ?? '',
-      inStock: Number(row[col.inStock] || 0),
-      reserved: Number(row[col.reserved] || 0),
-      available: Number(row[col.available] || 0),
-      newOrders: Number(row[col.newOrders] || 0),
-      balance: Number(row[col.balance] || 0),
+      productName: row[singleCol.productName] ?? '',
+      modelSize: row[singleCol.modelSize] ?? '',
+      inStock,
+      reserved,
+      available,
+      newOrders,
+      balance,
+      sheetAvailable: Number(row[singleCol.available] || 0), // for comparison only, see comment above
+      sheetBalance: Number(row[singleCol.balance] || 0),     // for comparison only, see comment above
       rowNumber: r + 1 // 1-based sheet row, for writing back to this exact row later
     });
   }
+
+  // recordNewOrderAgainstBatch writes into the FIRST new-order column found
+  // — the sheet has no way to know which specific batch a brand-new order
+  // should count against, so this matches the previous (pre-fix) behavior
+  // for that one write path rather than guessing which of several columns
+  // is "correct" to increment.
+  const col = { ...singleCol, reserved: batchCols[0], newOrders: newOrderCols[0] };
 
   return { batchLabel, products, columns: col };
 }
