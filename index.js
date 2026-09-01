@@ -256,6 +256,15 @@ async function getStockOverview() {
     const available = inStock - reserved;
     const balance = available - newOrders;
     const incoming = sumCols(row, incomingBatchCols) + sumCols(row, incomingNewOrderCols);
+    // Per-batch breakdown, not just the summed total — added 2026-09-01 so
+    // sales reps can see WHEN incoming stock actually arrives ("0 on
+    // shore, but 1 arriving on Batch 12"), not just a bare count. Each
+    // batch name here is the exact header text (e.g. "Batch 12") — join
+    // against /admin/batch-etas by that name (case-insensitive) to get a
+    // real date.
+    const incomingBreakdown = incomingBatchCols
+      .map((i) => ({ batch: headers[i], quantity: Number(row[i] || 0) }))
+      .filter((b) => b.quantity > 0);
 
     products.push({
       sku,
@@ -267,6 +276,7 @@ async function getStockOverview() {
       newOrders,
       balance,
       incoming, // pre-committed against shipment(s) still on the water — NOT part of on-shore available/balance
+      incomingBreakdown, // same total, broken down per batch — see comment above
       sheetAvailable: Number(row[singleCol.available] || 0), // for comparison only, see comment above
       sheetBalance: Number(row[singleCol.balance] || 0),     // for comparison only, see comment above
       rowNumber: r + 1 // 1-based sheet row, for writing back to this exact row later
