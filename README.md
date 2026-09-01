@@ -101,29 +101,43 @@ cell — this agent has no parsing logic for those tabs' real layout yet
 cell positions risks corrupting a manually-maintained sheet. Kept as this
 agent's own small persisted store instead.
 
-## Fixed: Available/Balance were undercounting real reservations (2026-09-01)
+## On-shore stock vs. incoming batches (2026-09-01, corrected same day)
 
 Confirmed live against the real deployed sheet (`Stock Overview_13.08.2026`
 — Xavier confirmed this is the real, currently-used tab; the sheet's own
 condition is rough — "our sheet is shit atm" — so treat every number as
 only as good as what's actually typed into it). The sheet has grown
 multiple "Batch N" reservation columns over time (Batch 10, 11, 12 all
-present at once) plus more than one "New Order(s)" column, but the tab's
-own Available/Balance formula cells were only ever wired to the FIRST
-batch column and never updated as later batch columns were added — real
-example: SKU-002 has 15 in stock, 5 reserved against Batch 10 AND 4 more
-against Batch 11 (9 total), so real availability is 6, but the sheet's own
-"Available" cell still shows 10 (just 15-5, silently ignoring Batch 11).
+present at once) plus more than one "New Order(s)" column.
 
-`getStockOverview()` now sums EVERY matching "Batch N" and "New Order(s)"
-column instead of just the first, and computes Available/Balance itself
-rather than trusting the sheet's stale single-batch formula cells (still
-returned as `sheetAvailable`/`sheetBalance` per product, for comparison —
-nothing in this codebase should use those two over the computed values).
-`recordNewOrderAgainstBatch` still writes to only the first "New
-Order(s)" column found, unchanged — the sheet has no way to know which
-specific batch a brand-new sale should count against, so this doesn't
-guess.
+**First attempt at this was wrong** — summed every "Batch N" column
+together as if they were all reservations against the SAME physical
+stock, which made SKU-004 look oversold by 3-4 units. Xavier corrected
+this: "batches get emptied into stock once they arrive to shore[s], but
+then the items allocated to clients are sent out" — and separately, "a
+new sale can be made on a sauna in the warehouse, on the water, or even a
+future order we haven't placed yet" (the same On Shore / On Water / Next
+Custom Order model used elsewhere in this project). "Batch 10," "Batch
+11," "Batch 12" are sequential SHIPMENTS, not parallel reservation
+buckets — only the first ("Batch 10," paired with In Stock/Available/
+Balance in the header order) has actually landed. Units reserved against
+Batch 11/12 are pre-commitments against stock still on the water and
+don't reduce what's physically in the warehouse today.
+
+`getStockOverview()` now computes on-shore `available`/`balance` from
+ONLY the landed batch (matching the sheet's own original single-batch
+formula — with this fix, `available`/`balance` should now agree with
+`sheetAvailable`/`sheetBalance`, still returned per product for
+comparison). Later batch columns are summed separately into a new
+`incoming` field per product — real, useful information, just not part
+of on-shore stock. SKU-004 is NOT actually oversold on-shore; it has
+units pre-committed against incoming shipments, which is different.
+
+`recordNewOrderAgainstBatch` writes to the landed batch's "New Orders"
+column specifically (not just "the first one found") — a generic
+"record a sale" call has no way to know which of the three buckets
+(shore/water/future) it's actually against, so this keeps assuming an
+unspecified sale is against current on-hand stock.
 
 ## Confirmed against the real spreadsheet (2026-09-01)
 

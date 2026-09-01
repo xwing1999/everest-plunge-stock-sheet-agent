@@ -169,27 +169,34 @@ async function insertClientRow(tabName, rowValues) {
 // so columns are found by pattern match on each read, never by a fixed
 // name or index.
 //
-// CORRECTED 2026-09-01 — Xavier: "the overview just reflects the different
-// batches etc along the bottom of the sheet, all the sub headings just
-// need to combine." Confirmed against real live data: the sheet has grown
-// MULTIPLE "Batch N" reservation columns over time (Batch 10, 11, 12 all
-// present simultaneously) plus more than one "New Order(s)" column, but
-// the tab's own "Available"/"Balance" formula cells were only ever written
-// to account for the FIRST batch column — they don't get updated as new
-// batch columns are added. Real example proving this (SKU-002): In Stock
-// 15, Batch 10 = 5, Batch 11 = 4 — actually available is 15-5-4=6, but the
-// sheet's own "Available" cell still shows 10 (just 15-5, ignoring Batch
-// 11 entirely). Trusting the sheet's own Available/Balance cells directly
-// (the previous behavior of this function) meant every SKU with stock
-// reserved against more than one open batch showed as having MORE stock
-// to sell than actually exists.
+// CORRECTED 2026-09-01, TWICE — first pass wrongly summed every "Batch N"
+// column together (see git history for that reasoning), which showed
+// SKU-004 as "oversold by 3" and was WRONG. Xavier corrected it: "batches
+// get emptied into stock once they arrive to shore[s], but then the items
+// allocated to clients are sent out" — and separately, "a new sale can be
+// made on a sauna in the warehouse, on the water, or even a future order
+// we haven't placed yet" (the same 3-bucket model — On Shore / On Water /
+// Next Custom Order — already used elsewhere in this project). That means
+// "Batch 10," "Batch 11," "Batch 12" are NOT multiple reservation buckets
+// against the SAME physical stock — they're sequential SHIPMENTS. Only
+// the first ("Batch 10," paired with In Stock/Available/Balance in the
+// header order) represents stock that's actually landed and sitting in
+// the warehouse. Batch 11/12 are still on the water — units reserved
+// against them don't reduce what's physically in the warehouse TODAY.
 //
-// Fixed by finding EVERY column matching the batch/new-order patterns (not
-// just the first) and summing them — Available and Balance are now
-// computed here, not read from the sheet's stale single-batch formula
-// cells. The sheet's own Available/Balance are still read back as
-// `sheetAvailable`/`sheetBalance` for comparison/debugging, but nothing
-// in this codebase should trust those two over the computed values.
+// Real numbers, corrected (SKU-002): In Stock 15, Batch 10 = 5 (landed,
+// reserved) -> Available = 10 today, matching the sheet's own original
+// formula. Batch 11 = 4 is a separate pre-commitment against a shipment
+// still incoming — shown as `incoming`, not subtracted from `available`.
+// SKU-004 is NOT actually oversold on current warehouse stock (the
+// previous version of this comment/code was wrong to say so) — it has 3
+// extra units pre-committed against incoming batches, which is a real
+// thing to track, just not an on-shore shortage.
+//
+// The sheet's own Available/Balance cells are still read back as
+// `sheetAvailable`/`sheetBalance` for comparison — with this fix they
+// should now agree with the computed `available`/`balance` for the
+// landed batch, since both use the same "first Batch N column" logic.
 // ---------------------------------------------------------------------------
 const STOCK_OVERVIEW_TAB = process.env.STOCK_OVERVIEW_TAB || '📦 Stock Overview';
 
@@ -217,15 +224,24 @@ async function getStockOverview() {
   const missing = Object.entries(singleCol).filter(([, idx]) => idx === -1).map(([name]) => name);
   if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}. Sheet structure may have changed — check "${STOCK_OVERVIEW_TAB}" by eye before trusting this.`);
 
-  // Every batch-reservation and new-order column, not just the first —
-  // this is the actual fix. "New Order" (no batch number, no parentheses)
-  // is real data-entry inconsistency in the live sheet, not a different
-  // concept — matched loosely on purpose.
+  // First "Batch N" column in header order = the landed/current batch,
+  // paired with In Stock/Available/Balance. Any later "Batch N" columns =
+  // still on the water, tracked separately as `incoming`, never
+  // subtracted from on-shore available/balance. "New Order" (bare, no
+  // batch number — real data-entry inconsistency in the live sheet) is
+  // paired to whichever batch's new-orders column it's NOT explicitly
+  // tagged for, i.e. treated as incoming too, unless proven otherwise.
   const batchCols = headers.map((h, i) => ({ h, i })).filter(({ h }) => /^batch\s*\d+$/i.test(h)).map(({ i }) => i);
-  const newOrderCols = headers.map((h, i) => ({ h, i })).filter(({ h }) => /^new orders?\b/i.test(h)).map(({ i }) => i);
   if (!batchCols.length) throw new Error(`Stock Overview header row has no "Batch N" column(s) — sheet structure may have changed.`);
+  const landedBatchCol = batchCols[0];
+  const incomingBatchCols = batchCols.slice(1);
+  const landedBatchNumber = headers[landedBatchCol].match(/\d+/)[0];
 
-  const batchLabel = batchCols.map((i) => headers[i]).join(' + ');
+  const allNewOrderCols = headers.map((h, i) => ({ h, i })).filter(({ h }) => /^new orders?\b/i.test(h)).map(({ i }) => i);
+  const landedNewOrdersCol = allNewOrderCols.find((i) => headers[i].includes(landedBatchNumber));
+  const incomingNewOrderCols = allNewOrderCols.filter((i) => i !== landedNewOrdersCol);
+
+  const batchLabel = headers[landedBatchCol];
   const sumCols = (row, cols) => cols.reduce((sum, i) => sum + Number(row[i] || 0), 0);
 
   const products = [];
@@ -235,10 +251,11 @@ async function getStockOverview() {
     if (!sku || sku.toUpperCase() === 'TOTALS') break;
 
     const inStock = Number(row[singleCol.inStock] || 0);
-    const reserved = sumCols(row, batchCols);
-    const newOrders = sumCols(row, newOrderCols);
+    const reserved = Number(row[landedBatchCol] || 0);
+    const newOrders = landedNewOrdersCol != null ? Number(row[landedNewOrdersCol] || 0) : 0;
     const available = inStock - reserved;
     const balance = available - newOrders;
+    const incoming = sumCols(row, incomingBatchCols) + sumCols(row, incomingNewOrderCols);
 
     products.push({
       sku,
@@ -249,18 +266,19 @@ async function getStockOverview() {
       available,
       newOrders,
       balance,
+      incoming, // pre-committed against shipment(s) still on the water — NOT part of on-shore available/balance
       sheetAvailable: Number(row[singleCol.available] || 0), // for comparison only, see comment above
       sheetBalance: Number(row[singleCol.balance] || 0),     // for comparison only, see comment above
       rowNumber: r + 1 // 1-based sheet row, for writing back to this exact row later
     });
   }
 
-  // recordNewOrderAgainstBatch writes into the FIRST new-order column found
-  // — the sheet has no way to know which specific batch a brand-new order
-  // should count against, so this matches the previous (pre-fix) behavior
-  // for that one write path rather than guessing which of several columns
-  // is "correct" to increment.
-  const col = { ...singleCol, reserved: batchCols[0], newOrders: newOrderCols[0] };
+  // recordNewOrderAgainstBatch writes into the landed batch's new-orders
+  // column — a generic "record a sale" call has no way to know whether it
+  // should count against on-shore, on-the-water, or a future order (see
+  // comment block above), so this keeps the pre-existing assumption that
+  // an unspecified sale is against current on-hand stock.
+  const col = { ...singleCol, reserved: landedBatchCol, newOrders: landedNewOrdersCol };
 
   return { batchLabel, products, columns: col };
 }
@@ -286,7 +304,13 @@ async function checkStockAvailability(sku, quantity) {
 // single-cell write into a malformed, row-only A1 range that could
 // overwrite the WRONG columns (e.g. Order ID) instead of failing loudly.
 function columnIndexToLetter(index) {
-  if (index < 0) throw new Error(`columnIndexToLetter: no such column (index ${index}) — a header may have been renamed or is missing from the sheet.`);
+  // Guards undefined too (not just negative), added 2026-09-01 — possible
+  // now that getStockOverview's `columns.newOrders` can be undefined (no
+  // "New Orders" column found tagged to the landed batch specifically).
+  // `undefined < 0` is false and the loop below silently no-ops on
+  // undefined, which previously returned '' instead of throwing — same
+  // malformed-write risk the negative-index guard was added for.
+  if (!(index >= 0)) throw new Error(`columnIndexToLetter: no such column (index ${index}) — a header may have been renamed or is missing from the sheet.`);
   let letter = '';
   let n = index;
   while (n >= 0) {
