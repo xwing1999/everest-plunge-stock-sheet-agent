@@ -608,6 +608,20 @@ async function markBatchArrived(batchReference) {
 // PRODUCTS TO ORDER — bucket 4 of Xavier's model, computed rather than
 // hand-maintained: every "Next Custom Order" deal not yet marked ordered,
 // grouped by SKU. This is the live shopping list for the next China order.
+//
+// EXTENDED 2026-09-01 — after the Stock Overview fix above surfaced a real
+// oversold SKU (more reserved across batch columns than physically in
+// stock), Xavier: "if it's oversold that means there should be another 3
+// in the pending to be ordered tab." Added `stockOverviewShortfall` per
+// SKU, from any product where getStockOverview()'s computed balance is
+// negative. Kept SEPARATE from `totalQuantity` (the Automation Log-based
+// count) rather than summed into one number — I can't confirm whether a
+// Stock Overview shortfall and a logged "Next Custom Order" deal for the
+// same SKU represent the same underlying units or different ones (the
+// batch-column data predates this ops-console/Automation-Log system and
+// may not overlap with it at all). Silently adding them risks
+// overstating how much actually needs ordering. Show both, let a human
+// reconcile before placing a real order.
 // ---------------------------------------------------------------------------
 async function getProductsToOrder() {
   const { entries } = await getAutomationLogRows();
@@ -620,6 +634,15 @@ async function getProductsToOrder() {
     bySku[sku].totalQuantity += Number(e['Quantity'] || 0);
     bySku[sku].orderIds.push(e['Order ID']);
   }
+
+  const { products } = await getStockOverview();
+  for (const p of products) {
+    if (p.balance < 0) {
+      if (!bySku[p.sku]) bySku[p.sku] = { sku: p.sku, product: p.productName, totalQuantity: 0, orderIds: [] };
+      bySku[p.sku].stockOverviewShortfall = -p.balance;
+    }
+  }
+
   return Object.values(bySku);
 }
 
