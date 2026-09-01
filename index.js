@@ -384,6 +384,13 @@ async function ensureAutomationLogTab() {
 }
 
 async function getAutomationLogRows() {
+  // Fixed 2026-09-01: on a brand-new sheet copy where the tab has never
+  // been created yet (only logSoldDeal's write path called
+  // ensureAutomationLogTab before), a plain values.get on a non-existent
+  // tab name throws "Unable to parse range" instead of just returning
+  // empty — broke every read endpoint (automation-log, products-to-order)
+  // until the first deal was ever logged.
+  await ensureAutomationLogTab();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
     range: AUTOMATION_LOG_TAB
