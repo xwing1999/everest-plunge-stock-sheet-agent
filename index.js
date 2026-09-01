@@ -792,14 +792,51 @@ app.get('/admin/read-tab', async (req, res) => {
   }
 });
 
+// A batch no longer needs its own physical tab (added 2026-09-01, per
+// Xavier wanting to know how new batches get created going forward) — any
+// "Batch Reference" value used when logging a deal or setting an ETA
+// automatically becomes its own grouped section here, same as a real
+// tab would, with zero setup. Grouped from the Automation Log, source:
+// 'console' — distinct from the legacy tab-based batches (source:
+// 'sheet') this endpoint already returned, which stay as a read-only
+// historical archive. A batch name that exists as BOTH (matched
+// case-insensitively) is folded into one entry, sheet source taking the
+// client list (it's the fuller historical record) with a note that
+// console-side entries exist too.
+async function getConsoleBatches() {
+  const { entries } = await getAutomationLogRows();
+  const byBatch = {};
+  for (const e of entries) {
+    const ref = (e['Batch Reference'] || '').toString().trim();
+    if (!ref) continue;
+    if (!byBatch[ref]) byBatch[ref] = [];
+    byBatch[ref].push({
+      orderId: e['Order ID'],
+      customerName: e['Customer Name'],
+      product: e['Product'] || e['SKU'],
+      allocation: e['Allocation'],
+      dealValue: e['Deal Value'],
+      depositStatus: e['Deposit Status'],
+      finalPaymentStatus: e['Final Payment Status']
+    });
+  }
+  return Object.entries(byBatch).map(([name, clientEntries]) => ({ name, clientCount: clientEntries.length, entries: clientEntries }));
+}
+
 app.get('/admin/batches', async (_req, res) => {
   try {
-    const names = await listBatchTabNames();
-    const batches = await Promise.all(names.map(async (name) => {
+    const [tabNames, consoleBatches] = await Promise.all([listBatchTabNames(), getConsoleBatches()]);
+    const sheetBatches = await Promise.all(tabNames.map(async (name) => {
       const entries = await getLedgerTab(name);
-      return { name, clientCount: entries.length, entries };
+      return { name, source: 'sheet', clientCount: entries.length, entries };
     }));
-    res.json({ batches });
+
+    const sheetNamesLower = new Set(sheetBatches.map((b) => b.name.toLowerCase()));
+    const newConsoleBatches = consoleBatches
+      .filter((b) => !sheetNamesLower.has(b.name.toLowerCase()))
+      .map((b) => ({ ...b, source: 'console' }));
+
+    res.json({ batches: [...sheetBatches, ...newConsoleBatches] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
