@@ -332,6 +332,76 @@ async function recordNewOrderAgainstBatchLocked(sku, quantity) {
 }
 
 // ---------------------------------------------------------------------------
+// REAL BATCH TABS — READ ONLY (added 2026-09-01). Xavier wants the console
+// to show "clear batch numbers and what's in there... a clear allocation
+// to each client just as the spreadsheet marks." Confirmed live (2026-09-01,
+// inspecting BATCH 12 and DELIVERED FIRST ORDERS directly) that these
+// ledger-style tabs share one real structure:
+//   Invoice No. | Invoice Date | Customer Name | Product | Status |
+//   Invoice Amount | Invoice Type | Status
+// (the 5th column holds the batch label, e.g. "Batch 12", or "Delivered"
+// on the DELIVERED FIRST ORDERS tab specifically). A real client row is
+// followed by zero or more continuation rows — Invoice No. blank, extra
+// detail (interior notes, freight cost, install notes) stacked in just
+// the Product column — folded into that client's `notes` array here
+// rather than treated as separate rows.
+//
+// Deliberately READ-ONLY — this agent has no verified-safe way to write
+// into these tabs (unlike Stock Overview's New Orders column, or its own
+// self-owned Automation Log). "Book Mainfreight tracking" and "close the
+// order" stay actions against the Automation Log (the agent's own
+// actionable record), never against these real tabs directly — this is
+// the reference/mirror view of what's actually in the spreadsheet, not
+// something the console writes back into.
+// ---------------------------------------------------------------------------
+function parseLedgerRows(rows) {
+  const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim() === 'Invoice No.');
+  if (headerRowIdx === -1) return [];
+
+  const entries = [];
+  let current = null;
+  for (let r = headerRowIdx + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const invoiceNo = (row[0] ?? '').toString().trim();
+    if (invoiceNo) {
+      if (current) entries.push(current);
+      current = {
+        invoiceNo,
+        invoiceDate: row[1] ?? '',
+        customerName: row[2] ?? '',
+        product: row[3] ?? '',
+        batchOrDeliveryStatus: row[4] ?? '',
+        invoiceAmount: row[5] ?? '',
+        invoiceType: row[6] ?? '',
+        paymentStatus: row[7] ?? '',
+        notes: []
+      };
+    } else if (current && (row[3] ?? '').toString().trim()) {
+      current.notes.push(row[3]);
+    }
+  }
+  if (current) entries.push(current);
+  return entries;
+}
+
+async function getLedgerTab(tabName) {
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: tabName });
+  return parseLedgerRows(res.data.values ?? []);
+}
+
+// Every real "BATCH N" tab, found by name pattern (never hardcoded — a
+// new batch tab is just a duplicate-and-rename of the template, per the
+// sheet's own "How To Use" instructions, so the set of real batches
+// changes over time).
+async function listBatchTabNames() {
+  const sheetsMeta = await getSheetMeta();
+  return sheetsMeta
+    .map((s) => s.properties.title)
+    .filter((name) => /^BATCH\s+\d+$/i.test(name))
+    .sort((a, b) => Number(b.match(/\d+/)[0]) - Number(a.match(/\d+/)[0])); // newest batch first
+}
+
+// ---------------------------------------------------------------------------
 // AUTOMATION LOG (added 2026-08-31) — a tab this agent fully owns and
 // creates itself, deliberately SEPARATE from the real batch tabs. Xavier
 // needs a working "log a sold deal / mark an order sent" tool now, but the
@@ -693,6 +763,37 @@ app.get('/admin/read-tab', async (req, res) => {
   try {
     const result = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: tabName });
     res.json({ rows: result.data.values ?? [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/batches', async (_req, res) => {
+  try {
+    const names = await listBatchTabNames();
+    const batches = await Promise.all(names.map(async (name) => {
+      const entries = await getLedgerTab(name);
+      return { name, clientCount: entries.length, entries };
+    }));
+    res.json({ batches });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/batch/:name', async (req, res) => {
+  try {
+    const entries = await getLedgerTab(req.params.name);
+    res.json({ name: req.params.name, clientCount: entries.length, entries });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/delivered-orders', async (_req, res) => {
+  try {
+    const entries = await getLedgerTab(process.env.DELIVERED_ORDERS_TAB || 'DELIVERED FIRST ORDERS');
+    res.json({ clientCount: entries.length, entries });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
