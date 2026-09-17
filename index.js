@@ -1137,10 +1137,10 @@ app.get('/admin/stock-overview-raw-column-a', async (_req, res) => {
   try {
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.SHEET_ID,
-      range: `'${STOCK_OVERVIEW_TAB}'!A:A`
+      range: STOCK_OVERVIEW_TAB
     });
     const rows = result.data.values ?? [];
-    res.json({ rows: rows.map((r, i) => ({ rowNumber: i + 1, value: r[0] ?? '' })) });
+    res.json({ rows: rows.map((r, i) => ({ rowNumber: i + 1, values: r })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
