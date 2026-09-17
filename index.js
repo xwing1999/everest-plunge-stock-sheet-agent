@@ -1176,49 +1176,6 @@ app.post('/admin/assign-stock-sku', async (req, res) => {
   }
 });
 
-// Temporary cleanup (added 2026-09-17) — removes the rows created by the
-// values.append bug above (SKU-008..011 landed past the TOTALS row, and
-// one had a "+"-prefixed Model/Size value Sheets mangled into #ERROR!).
-// Deletes an inclusive 1-based row range. Remove this endpoint once the
-// cleanup is done — it is deliberately blunt (no SKU/content check) and
-// should not become a permanent way to delete rows.
-app.post('/admin/delete-stock-overview-rows', async (req, res) => {
-  const { startRow, endRow } = req.body;
-  if (!startRow || !endRow) return res.status(400).json({ error: 'startRow and endRow (1-based, inclusive) are required' });
-  try {
-    const sheetId = await getSheetIdByTitle(STOCK_OVERVIEW_TAB);
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: process.env.SHEET_ID,
-      requestBody: {
-        requests: [{
-          deleteDimension: {
-            range: { sheetId, dimension: 'ROWS', startIndex: startRow - 1, endIndex: endRow }
-          }
-        }]
-      }
-    });
-    res.json({ ok: true, deletedRows: `${startRow}-${endRow}` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Temporary diagnostic (added 2026-09-17) — to see exactly where the
-// TOTALS row sits and where the mis-appended SKU-008..011 rows landed
-// after the values.append bug below. Remove once that's cleaned up.
-app.get('/admin/stock-overview-raw-column-a', async (_req, res) => {
-  try {
-    const result = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SHEET_ID,
-      range: STOCK_OVERVIEW_TAB
-    });
-    const rows = result.data.values ?? [];
-    res.json({ rows: rows.map((r, i) => ({ rowNumber: i + 1, values: r })) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post('/admin/add-stock-product', async (req, res) => {
   const { sku, productName, modelSize, inStock } = req.body;
   if (!sku || !productName) return res.status(400).json({ error: 'sku and productName are required' });
