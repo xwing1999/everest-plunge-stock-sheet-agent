@@ -1067,6 +1067,8 @@ app.post('/admin/mark-order-placed', async (req, res) => {
 const PAYMENT_AUDIT_CACHE_TAB = process.env.PAYMENT_AUDIT_CACHE_TAB || '🔍 Payment Audit Cache';
 const PAYMENT_AUDIT_CACHE_HEADERS = [
   'Opportunity ID', 'Deal', 'Rep', 'Stage', 'Deal Value', 'Contact Email',
+  'Has Invoice (Pipely)', 'Invoice Number (Pipely)', 'Invoice Status (Pipely)',
+  'Xero Invoice Number', 'Xero Status', 'Xero Amount Due',
   'No Invoice In Xero', 'Status Mismatch', 'Not Found In Xero', 'Check Failed', 'Check Error',
   'Xero Invoices Summary', 'Xero Invoices JSON', 'Total Invoiced To Contact', 'Generated At'
 ];
@@ -1097,6 +1099,12 @@ app.post('/admin/write-payment-audit-cache', async (req, res) => {
     const values = rows.map((r) => [
       r.opportunityId ?? '', r.dealName ?? '', r.rep ?? '', r.stage ?? '', r.dealValue ?? '',
       r.contactEmail ?? '',
+      r.hasInvoice ? 'TRUE' : 'FALSE',
+      r.invoiceNumber ?? '',
+      r.invoiceStatus ?? '',
+      r.xeroInvoiceNumber ?? '',
+      r.xeroStatus ?? '',
+      r.xeroAmountDue ?? '',
       r.noInvoiceInXero ? 'TRUE' : 'FALSE',
       r.statusMismatch ? 'TRUE' : 'FALSE',
       r.notFoundInXero ? 'TRUE' : 'FALSE',
@@ -1153,6 +1161,12 @@ app.get('/admin/payment-audit-cache', async (_req, res) => {
         stage: e['Stage'],
         dealValue: e['Deal Value'] ? Number(e['Deal Value']) : null,
         contactEmail: e['Contact Email'] || null,
+        hasInvoice: e['Has Invoice (Pipely)'] === 'TRUE',
+        invoiceNumber: e['Invoice Number (Pipely)'] || null,
+        invoiceStatus: e['Invoice Status (Pipely)'] || null,
+        xeroInvoiceNumber: e['Xero Invoice Number'] || null,
+        xeroStatus: e['Xero Status'] || null,
+        xeroAmountDue: e['Xero Amount Due'] !== '' ? Number(e['Xero Amount Due']) : null,
         noInvoiceInXero: e['No Invoice In Xero'] === 'TRUE',
         statusMismatch: e['Status Mismatch'] === 'TRUE',
         notFoundInXero: e['Not Found In Xero'] === 'TRUE',
