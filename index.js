@@ -1092,16 +1092,59 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
   newRow[idx.modelSize] = modelSize ?? '';
   newRow[idx.inStock] = inStock ?? 0;
 
-  await sheets.spreadsheets.values.append({
+  // NOT values.append — a real bug found 2026-09-17: the real sheet has a
+  // TOTALS row (or a blank-SKU row) after the last real product, and
+  // getStockOverview's own read loop stops at the first blank/TOTALS SKU
+  // cell (`if (!sku || sku.toUpperCase() === 'TOTALS') break;`). append()
+  // adds the new row at the true bottom of the tab, past that row, where
+  // the read loop never sees it. Insert a blank row immediately BEFORE
+  // the terminating row instead — same insertDimension pattern
+  // insertClientRow above uses for batch tabs, which also lets any SUM
+  // formula whose range already spans this position pick up the new row.
+  let insertBeforeIdx = rows.length; // fallback: nothing terminates, insert at the very end
+  for (let r = headerRowIdx + 1; r < rows.length; r++) {
+    const rowSku = (rows[r][idx.sku] ?? '').toString().trim();
+    if (!rowSku || rowSku.toUpperCase() === 'TOTALS') { insertBeforeIdx = r; break; }
+  }
+
+  const sheetId = await getSheetIdByTitle(STOCK_OVERVIEW_TAB);
+  await sheets.spreadsheets.batchUpdate({
     spreadsheetId: process.env.SHEET_ID,
-    range: STOCK_OVERVIEW_TAB,
+    requestBody: {
+      requests: [{
+        insertDimension: {
+          range: { sheetId, dimension: 'ROWS', startIndex: insertBeforeIdx, endIndex: insertBeforeIdx + 1 },
+          inheritFromBefore: true
+        }
+      }]
+    }
+  });
+  const rowNumber = insertBeforeIdx + 1; // 0-based index -> 1-based row number
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${STOCK_OVERVIEW_TAB}'!A${rowNumber}`,
     valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
     requestBody: { values: [newRow] }
   });
 
-  return { sku, productName, modelSize: modelSize ?? '', inStock: inStock ?? 0 };
+  return { sku, productName, modelSize: modelSize ?? '', inStock: inStock ?? 0, rowNumber };
 }
+
+// Temporary diagnostic (added 2026-09-17) — to see exactly where the
+// TOTALS row sits and where the mis-appended SKU-008..011 rows landed
+// after the values.append bug below. Remove once that's cleaned up.
+app.get('/admin/stock-overview-raw-column-a', async (_req, res) => {
+  try {
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `'${STOCK_OVERVIEW_TAB}'!A:A`
+    });
+    const rows = result.data.values ?? [];
+    res.json({ rows: rows.map((r, i) => ({ rowNumber: i + 1, value: r[0] ?? '' })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/admin/add-stock-product', async (req, res) => {
   const { sku, productName, modelSize, inStock } = req.body;
