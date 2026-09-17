@@ -1120,15 +1120,88 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
     }
   });
   const rowNumber = insertBeforeIdx + 1; // 0-based index -> 1-based row number
+  // RAW, not USER_ENTERED — a real bug found 2026-09-17: a Model/Size
+  // value starting with "+" (e.g. "+ EP1 Chiller") got parsed by Sheets
+  // as an arithmetic formula under USER_ENTERED and landed as #ERROR!.
+  // Product metadata should never be formula-interpreted.
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
     range: `'${STOCK_OVERVIEW_TAB}'!A${rowNumber}`,
-    valueInputOption: 'USER_ENTERED',
+    valueInputOption: 'RAW',
     requestBody: { values: [newRow] }
   });
 
   return { sku, productName, modelSize: modelSize ?? '', inStock: inStock ?? 0, rowNumber };
 }
+
+// Fills in a blank SKU cell on an EXISTING row — for real product rows
+// found with no SKU at all (confirmed live 2026-09-17: "Traditional
+// Sauna" 5-6/7-8 Person rows already had real committed batch quantities
+// but no SKU, so every read path silently skipped them entirely). Only
+// ever touches the single SKU cell — never rewrites the row — so
+// whatever real data already sits there (In Stock, batch columns,
+// Warehouse, Notes) is left exactly as-is. Refuses to overwrite a row
+// that already has a SKU, same duplicate-safety as addStockProduct.
+async function assignStockSku({ rowNumber, sku }) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SHEET_ID,
+    range: STOCK_OVERVIEW_TAB
+  });
+  const rows = res.data.values ?? [];
+  const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row in "${STOCK_OVERVIEW_TAB}".`);
+  const rowIdx = rowNumber - 1;
+  if (rowIdx <= headerRowIdx || rowIdx >= rows.length) throw new Error(`Row ${rowNumber} is out of range for a product row.`);
+  const currentSku = (rows[rowIdx][0] ?? '').toString().trim();
+  if (currentSku) throw new Error(`Row ${rowNumber} already has SKU "${currentSku}" — refusing to overwrite.`);
+  const dupe = rows.slice(headerRowIdx + 1).some((row) => (row[0] ?? '').toString().trim().toUpperCase() === sku.toUpperCase());
+  if (dupe) throw new Error(`SKU "${sku}" already exists in Stock Overview — refusing to add a duplicate.`);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${STOCK_OVERVIEW_TAB}'!A${rowNumber}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[sku]] }
+  });
+  return { rowNumber, sku, existingRow: rows[rowIdx] };
+}
+
+app.post('/admin/assign-stock-sku', async (req, res) => {
+  const { rowNumber, sku } = req.body;
+  if (!rowNumber || !sku) return res.status(400).json({ error: 'rowNumber and sku are required' });
+  try {
+    res.json({ ok: true, ...(await assignStockSku({ rowNumber: Number(rowNumber), sku })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Temporary cleanup (added 2026-09-17) — removes the rows created by the
+// values.append bug above (SKU-008..011 landed past the TOTALS row, and
+// one had a "+"-prefixed Model/Size value Sheets mangled into #ERROR!).
+// Deletes an inclusive 1-based row range. Remove this endpoint once the
+// cleanup is done — it is deliberately blunt (no SKU/content check) and
+// should not become a permanent way to delete rows.
+app.post('/admin/delete-stock-overview-rows', async (req, res) => {
+  const { startRow, endRow } = req.body;
+  if (!startRow || !endRow) return res.status(400).json({ error: 'startRow and endRow (1-based, inclusive) are required' });
+  try {
+    const sheetId = await getSheetIdByTitle(STOCK_OVERVIEW_TAB);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: { sheetId, dimension: 'ROWS', startIndex: startRow - 1, endIndex: endRow }
+          }
+        }]
+      }
+    });
+    res.json({ ok: true, deletedRows: `${startRow}-${endRow}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Temporary diagnostic (added 2026-09-17) — to see exactly where the
 // TOTALS row sits and where the mis-appended SKU-008..011 rows landed
