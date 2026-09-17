@@ -1050,6 +1050,70 @@ app.post('/admin/mark-order-placed', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ADD STOCK PRODUCT (added 2026-09-17) — Xavier: "include all the products
+// we actually sell... look at the spreadsheets actually the main place
+// because that's the actual orders and stuff that we're actually doing."
+// Cross-referencing real historical invoice line items (Batch tabs,
+// Delivered orders) against the current 7-SKU Stock Overview found real
+// products with zero rows at all: Vulcan, Black Nordic Tub, Black Cold
+// Plunge, Cedar Pro. Appends a new row with only SKU/Product Name/Model-
+// Size/In Stock filled in -- In Stock defaults to 0 (the honest, safe
+// value with no confirmed physical count; understating availability is
+// safe, overstating it risks overselling) -- everything else (Available/
+// Balance/Batch columns) left blank, which every read path already
+// treats as 0. Refuses to touch an existing SKU rather than risk
+// duplicating or clobbering real inventory data.
+// ---------------------------------------------------------------------------
+async function addStockProduct({ sku, productName, modelSize, inStock }) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SHEET_ID,
+    range: STOCK_OVERVIEW_TAB
+  });
+  const rows = res.data.values ?? [];
+  const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${STOCK_OVERVIEW_TAB}".`);
+  const headers = rows[headerRowIdx].map((h) => (h ?? '').toString().trim());
+
+  const idx = {
+    sku: headers.findIndex((h) => h.toUpperCase() === 'SKU'),
+    productName: headers.findIndex((h) => h.toUpperCase() === 'PRODUCT NAME'),
+    modelSize: headers.findIndex((h) => h.toUpperCase().startsWith('MODEL')),
+    inStock: headers.findIndex((h) => h.toUpperCase() === 'IN STOCK')
+  };
+  const missing = Object.entries(idx).filter(([, i]) => i === -1).map(([k]) => k);
+  if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}.`);
+
+  const existing = rows.slice(headerRowIdx + 1).some((row) => (row[idx.sku] ?? '').toString().trim().toUpperCase() === sku.toUpperCase());
+  if (existing) throw new Error(`SKU "${sku}" already exists in Stock Overview — refusing to add a duplicate.`);
+
+  const newRow = new Array(headers.length).fill('');
+  newRow[idx.sku] = sku;
+  newRow[idx.productName] = productName;
+  newRow[idx.modelSize] = modelSize ?? '';
+  newRow[idx.inStock] = inStock ?? 0;
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SHEET_ID,
+    range: STOCK_OVERVIEW_TAB,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [newRow] }
+  });
+
+  return { sku, productName, modelSize: modelSize ?? '', inStock: inStock ?? 0 };
+}
+
+app.post('/admin/add-stock-product', async (req, res) => {
+  const { sku, productName, modelSize, inStock } = req.body;
+  if (!sku || !productName) return res.status(400).json({ error: 'sku and productName are required' });
+  try {
+    res.json({ ok: true, ...(await addStockProduct({ sku, productName, modelSize, inStock: Number(inStock) || 0 })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // PAYMENT AUDIT CACHE (added 2026-09-17) — Xavier: "I'm having a bit of
 // delay on loading times, the group needs to be backed in the
 // spreadsheet. You must automatically edit the spreadsheet and add more
