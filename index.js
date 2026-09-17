@@ -1076,12 +1076,20 @@ const PAYMENT_AUDIT_CACHE_HEADERS = [
 async function ensurePaymentAuditCacheTab() {
   const sheetsMeta = await getSheetMeta();
   const exists = sheetsMeta.some((s) => s.properties.title === PAYMENT_AUDIT_CACHE_TAB);
-  if (exists) return;
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: process.env.SHEET_ID,
-    requestBody: { requests: [{ addSheet: { properties: { title: PAYMENT_AUDIT_CACHE_TAB } } }] }
-  });
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: PAYMENT_AUDIT_CACHE_TAB } } }] }
+    });
+  }
+  // Always rewrite the header row, even if the tab already existed — a
+  // real bug found 2026-09-17: the tab was first created under an earlier,
+  // narrower version of PAYMENT_AUDIT_CACHE_HEADERS, and because this used
+  // to skip the header write once the tab existed, the header row never
+  // picked up later columns (Has Invoice, Invoice Status, etc.), silently
+  // misaligning every column against the wider data rows this now writes
+  // (e.g. reading "Generated At" back as the boolean from a totally
+  // different column). Rewriting A1 every call is cheap and idempotent.
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
     range: `'${PAYMENT_AUDIT_CACHE_TAB}'!A1`,
