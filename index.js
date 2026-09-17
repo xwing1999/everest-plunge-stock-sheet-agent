@@ -1049,6 +1049,139 @@ app.post('/admin/mark-order-placed', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PAYMENT AUDIT CACHE (added 2026-09-17) — Xavier: "I'm having a bit of
+// delay on loading times, the group needs to be backed in the
+// spreadsheet. You must automatically edit the spreadsheet and add more
+// tabs and layouts if you need more supporting area." pipely-xero-agent's
+// invoice-check makes several batched but still real Xero API calls per
+// run (~20s), which was making the console's Needs Attention / Payment
+// Audit pages slow to load every single time they were opened. This tab
+// is a snapshot cache that pipely-xero-agent refreshes on its own
+// schedule (see that agent's schedulePaymentAuditCacheRefresh) — the
+// console reads this tab instead of triggering a live Xero check on
+// every page load. Overwritten wholesale each refresh (not an
+// append-only log like the Automation Log) — it's a snapshot, not a
+// history, so a shrinking result never leaves stale rows behind.
+// ---------------------------------------------------------------------------
+const PAYMENT_AUDIT_CACHE_TAB = process.env.PAYMENT_AUDIT_CACHE_TAB || '🔍 Payment Audit Cache';
+const PAYMENT_AUDIT_CACHE_HEADERS = [
+  'Opportunity ID', 'Deal', 'Rep', 'Stage', 'Deal Value', 'Contact Email',
+  'No Invoice In Xero', 'Status Mismatch', 'Not Found In Xero', 'Check Failed', 'Check Error',
+  'Xero Invoices Summary', 'Xero Invoices JSON', 'Total Invoiced To Contact', 'Generated At'
+];
+
+async function ensurePaymentAuditCacheTab() {
+  const sheetsMeta = await getSheetMeta();
+  const exists = sheetsMeta.some((s) => s.properties.title === PAYMENT_AUDIT_CACHE_TAB);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: PAYMENT_AUDIT_CACHE_TAB } } }] }
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${PAYMENT_AUDIT_CACHE_TAB}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [PAYMENT_AUDIT_CACHE_HEADERS] }
+  });
+}
+
+app.post('/admin/write-payment-audit-cache', async (req, res) => {
+  const { rows, generatedAt } = req.body;
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows array is required' });
+  try {
+    await ensurePaymentAuditCacheTab();
+    const when = generatedAt || new Date().toISOString();
+    const values = rows.map((r) => [
+      r.opportunityId ?? '', r.dealName ?? '', r.rep ?? '', r.stage ?? '', r.dealValue ?? '',
+      r.contactEmail ?? '',
+      r.noInvoiceInXero ? 'TRUE' : 'FALSE',
+      r.statusMismatch ? 'TRUE' : 'FALSE',
+      r.notFoundInXero ? 'TRUE' : 'FALSE',
+      r.checkFailed ? 'TRUE' : 'FALSE',
+      r.xeroCheckError ?? '',
+      r.xeroInvoicesSummary ?? '',
+      JSON.stringify(r.xeroInvoicesForContact ?? []),
+      r.xeroTotalInvoicedToContact ?? '',
+      when
+    ]);
+    // Clear everything below the header first — a wholesale overwrite,
+    // not an append, so a smaller result this run doesn't leave stale
+    // rows from a larger previous run.
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `'${PAYMENT_AUDIT_CACHE_TAB}'!A2:Z100000`
+    });
+    if (values.length) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.SHEET_ID,
+        range: `'${PAYMENT_AUDIT_CACHE_TAB}'!A2`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values }
+      });
+    }
+    res.json({ ok: true, rowCount: values.length, generatedAt: when });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/payment-audit-cache', async (_req, res) => {
+  try {
+    await ensurePaymentAuditCacheTab();
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: PAYMENT_AUDIT_CACHE_TAB
+    });
+    const rows = result.data.values ?? [];
+    const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim() === 'Opportunity ID');
+    if (headerRowIdx === -1) return res.json({ generatedAt: null, count: 0, deals: [], noInvoiceInXeroCount: 0, noInvoiceInXero: [], statusMismatchCount: 0, statusMismatch: [], notFoundInXeroCount: 0, notFoundInXero: [], checkFailedCount: 0, checkFailed: [] });
+    const headers = rows[headerRowIdx];
+    const entries = rows.slice(headerRowIdx + 1)
+      .map((row) => Object.fromEntries(headers.map((h, idx) => [h, row[idx] ?? ''])))
+      .filter((e) => e['Opportunity ID']);
+
+    const deals = entries.map((e) => {
+      let xeroInvoicesForContact = [];
+      try { xeroInvoicesForContact = JSON.parse(e['Xero Invoices JSON'] || '[]'); } catch { xeroInvoicesForContact = []; }
+      return {
+        opportunityId: e['Opportunity ID'],
+        dealName: e['Deal'],
+        rep: e['Rep'],
+        stage: e['Stage'],
+        dealValue: e['Deal Value'] ? Number(e['Deal Value']) : null,
+        contactEmail: e['Contact Email'] || null,
+        noInvoiceInXero: e['No Invoice In Xero'] === 'TRUE',
+        statusMismatch: e['Status Mismatch'] === 'TRUE',
+        notFoundInXero: e['Not Found In Xero'] === 'TRUE',
+        checkFailed: e['Check Failed'] === 'TRUE',
+        xeroCheckError: e['Check Error'] || null,
+        xeroInvoicesSummary: e['Xero Invoices Summary'] || '',
+        xeroInvoicesForContact,
+        xeroTotalInvoicedToContact: e['Total Invoiced To Contact'] ? Number(e['Total Invoiced To Contact']) : null
+      };
+    });
+
+    res.json({
+      generatedAt: entries[0]?.['Generated At'] || null,
+      count: deals.length,
+      noInvoiceInXeroCount: deals.filter((d) => d.noInvoiceInXero).length,
+      noInvoiceInXero: deals.filter((d) => d.noInvoiceInXero),
+      statusMismatchCount: deals.filter((d) => d.statusMismatch).length,
+      statusMismatch: deals.filter((d) => d.statusMismatch),
+      notFoundInXeroCount: deals.filter((d) => d.notFoundInXero).length,
+      notFoundInXero: deals.filter((d) => d.notFoundInXero),
+      checkFailedCount: deals.filter((d) => d.checkFailed).length,
+      checkFailed: deals.filter((d) => d.checkFailed),
+      deals
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3009;
