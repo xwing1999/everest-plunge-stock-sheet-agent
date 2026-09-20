@@ -1207,7 +1207,9 @@ const PAYMENT_AUDIT_CACHE_HEADERS = [
   'Has Invoice (Pipely)', 'Invoice Number (Pipely)', 'Invoice Status (Pipely)',
   'Xero Invoice Number', 'Xero Status', 'Xero Amount Due',
   'No Invoice In Xero', 'Status Mismatch', 'Not Found In Xero', 'Check Failed', 'Check Error',
-  'Xero Invoices Summary', 'Xero Invoices JSON', 'Total Invoiced To Contact', 'Generated At'
+  'Xero Invoices Summary', 'Xero Invoices JSON', 'Total Invoiced To Contact',
+  'Stuck Deposit Paid', 'Xero Deposit Invoice Number', 'Xero Deposit Amount Paid',
+  'Generated At'
 ];
 
 async function ensurePaymentAuditCacheTab() {
@@ -1258,6 +1260,9 @@ app.post('/admin/write-payment-audit-cache', async (req, res) => {
       r.xeroInvoicesSummary ?? '',
       JSON.stringify(r.xeroInvoicesForContact ?? []),
       r.xeroTotalInvoicedToContact ?? '',
+      r.stuckDepositPaid ? 'TRUE' : 'FALSE',
+      r.xeroDepositInvoiceNumber ?? '',
+      r.xeroDepositAmountPaid ?? '',
       when
     ]);
     // Clear everything below the header first — a wholesale overwrite,
@@ -1290,7 +1295,7 @@ app.get('/admin/payment-audit-cache', async (_req, res) => {
     });
     const rows = result.data.values ?? [];
     const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim() === 'Opportunity ID');
-    if (headerRowIdx === -1) return res.json({ generatedAt: null, count: 0, deals: [], noInvoiceInXeroCount: 0, noInvoiceInXero: [], statusMismatchCount: 0, statusMismatch: [], notFoundInXeroCount: 0, notFoundInXero: [], checkFailedCount: 0, checkFailed: [] });
+    if (headerRowIdx === -1) return res.json({ generatedAt: null, count: 0, deals: [], noInvoiceInXeroCount: 0, noInvoiceInXero: [], statusMismatchCount: 0, statusMismatch: [], notFoundInXeroCount: 0, notFoundInXero: [], checkFailedCount: 0, checkFailed: [], stuckDepositPaidCount: 0, stuckDepositPaid: [] });
     const headers = rows[headerRowIdx];
     const entries = rows.slice(headerRowIdx + 1)
       .map((row) => Object.fromEntries(headers.map((h, idx) => [h, row[idx] ?? ''])))
@@ -1319,7 +1324,10 @@ app.get('/admin/payment-audit-cache', async (_req, res) => {
         xeroCheckError: e['Check Error'] || null,
         xeroInvoicesSummary: e['Xero Invoices Summary'] || '',
         xeroInvoicesForContact,
-        xeroTotalInvoicedToContact: e['Total Invoiced To Contact'] ? Number(e['Total Invoiced To Contact']) : null
+        xeroTotalInvoicedToContact: e['Total Invoiced To Contact'] ? Number(e['Total Invoiced To Contact']) : null,
+        stuckDepositPaid: e['Stuck Deposit Paid'] === 'TRUE',
+        xeroDepositInvoiceNumber: e['Xero Deposit Invoice Number'] || null,
+        xeroDepositAmountPaid: e['Xero Deposit Amount Paid'] !== '' ? Number(e['Xero Deposit Amount Paid']) : null
       };
     });
 
@@ -1334,6 +1342,8 @@ app.get('/admin/payment-audit-cache', async (_req, res) => {
       notFoundInXero: deals.filter((d) => d.notFoundInXero),
       checkFailedCount: deals.filter((d) => d.checkFailed).length,
       checkFailed: deals.filter((d) => d.checkFailed),
+      stuckDepositPaidCount: deals.filter((d) => d.stuckDepositPaid).length,
+      stuckDepositPaid: deals.filter((d) => d.stuckDepositPaid),
       deals
     });
   } catch (err) {
