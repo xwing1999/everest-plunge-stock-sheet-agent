@@ -1351,6 +1351,234 @@ app.get('/admin/payment-audit-cache', async (_req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// TEMPLATE SPREADSHEET GENERATOR (added 2026-09-22) — Xavier: "the data
+// backing the console is very messy... generate a spreadsheet that is a
+// good format for us to fill out." Creates a brand NEW Google Spreadsheet
+// (never touches the live one) with a clean template: one row per
+// physical unit/allocation, not an aggregate count — "X sauna is
+// currently allocated to Fred and needs to be sent" is the literal shape.
+// Product/quantity totals are seeded live from getStockOverview() so
+// they're always accurate to whatever's really in the sheet right now.
+// Customer names for Batch 11/12 are pre-filled from the real historical
+// Batch Tabs data ONLY where a confident match to the batch's own tracked
+// per-SKU quantity exists (cross-checked by hand against the raw data —
+// see "Data Issues Found" tab for the real mismatches this surfaced,
+// e.g. clients invoiced against a batch whose product doesn't appear in
+// that batch's tracked incoming count at all). Nothing here fabricates a
+// name/unit pairing that isn't backed by a real invoice record. Stock On
+// Shore has no such source (the Automation Log is still empty) so its
+// allocation rows are intentionally blank, real quantities only — that's
+// for the team to fill in from what they actually know. Temporary,
+// one-off endpoint — remove once the sheet's been generated and reviewed.
+// ---------------------------------------------------------------------------
+const TEMPLATE_HEADER_ROW = ['SKU', 'Product', 'Model / Size', 'Allocated To', 'Contact', 'Status', 'Notes'];
+
+function templateRowsForProduct(sku, productName, modelSize, count, prefill = []) {
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    const p = prefill[i];
+    rows.push([
+      sku, productName, modelSize,
+      p?.name ?? '', p?.contact ?? '', p?.status ?? (p ? 'Needs to be sent' : 'Available — not yet allocated'),
+      p?.notes ?? ''
+    ]);
+  }
+  return rows;
+}
+
+async function buildTemplateSheetRequests() {
+  const { products } = await getStockOverview();
+  const bySku = Object.fromEntries(products.map((p) => [p.sku, p]));
+  const sheets_ = [];
+
+  // --- How To Use ---
+  sheets_.push({
+    title: 'How To Use',
+    rows: [
+      ['Everest Plunge — Stock & Allocation Tracker'],
+      [''],
+      ['What this is'],
+      ['One row per physical unit, not an aggregate count. If a sauna is sold and waiting to ship, it gets its own row with the customer\'s name and contact next to it — not just a number.'],
+      [''],
+      ['How to use it'],
+      ['- "Stock On Shore": every unit physically in the Silverdale/Auckland warehouse right now. Fill in Allocated To / Contact / Status for units already promised to a client. Leave blank rows as "Available".'],
+      ['- "Batch 11/12 — On Water": units already ordered and on the water for that shipment. Some rows are pre-filled from real invoice records (see below) — check them. Blank rows are genuine gaps: ordered, but not yet promised to anyone.'],
+      ['- "Next Custom Order": deals that are sold but not yet placed with the manufacturer at all.'],
+      ['- "Data Issues Found": real mismatches this generation run found between the old batch records and the current tracked stock counts. Needs a human to resolve — not guessed at here.'],
+      ['- "Checks & Balances (Auto)": NOT for manual entry. This mirrors the live Payment Audit Cache the console already writes automatically every 90 minutes — shown here just so the format is understood.'],
+      [''],
+      ['Status values to use'],
+      ['Available — not yet allocated  |  Needs to be sent  |  Shipped  |  On hold'],
+      [''],
+      [`Generated ${new Date().toISOString().slice(0, 10)} from live Stock Overview data.`]
+    ],
+    columnWidths: [720]
+  });
+
+  // --- Stock On Shore --- (real quantities, blank allocation — no source data to prefill from)
+  const shoreRows = [TEMPLATE_HEADER_ROW];
+  for (const p of products) {
+    if (p.inStock > 0) shoreRows.push(...templateRowsForProduct(p.sku, p.productName, p.modelSize, p.inStock));
+  }
+  sheets_.push({ title: 'Stock On Shore', rows: shoreRows, freeze: 1 });
+
+  // --- Batch 12 — On Water --- (clean 1:1 match against real Batch Tabs data, confirmed by hand)
+  const batch12Prefill = {
+    'SKU-001': [{ name: 'Jed Melling', contact: '', status: 'Needs to be sent', notes: 'Invoice #146 — Cedar interior, collection from yard' }],
+    'SKU-004': [{ name: 'Kenny Pryor', contact: '', status: 'Needs to be sent', notes: 'Invoice #149 — 50% tint on glass, shipping' }],
+    'SKU-008': [{ name: 'Noel McGirr', contact: '', status: 'Needs to be sent', notes: 'Invoice #150 — Freight $850' }]
+  };
+  const batch12Rows = [TEMPLATE_HEADER_ROW];
+  for (const p of products) {
+    const incoming = (p.incomingBreakdown || []).find((b) => b.batch === 'Batch 12');
+    if (incoming) batch12Rows.push(...templateRowsForProduct(p.sku, p.productName, p.modelSize, incoming.quantity, batch12Prefill[p.sku] || []));
+  }
+  sheets_.push({ title: 'Batch 12 - On Water', rows: batch12Rows, freeze: 1 });
+
+  // --- Batch 11 — On Water --- (best-effort match; real gaps and mismatches left visible, not forced to fit)
+  const batch11Prefill = {
+    'SKU-003': [
+      { name: 'Jaz Steiner', status: 'Needs to be sent', notes: 'Invoice #46 — Hamilton delivery, custom size' },
+      { name: 'Judith Erren', status: 'Needs to be sent', notes: 'Invoice #48 — Flat roof, Christchurch freight' }
+    ],
+    'SKU-002': [
+      { name: 'Brittnee Southland', status: 'Needs to be sent', notes: 'Invoice #47' },
+      { name: 'Petra Samland', status: 'Needs to be sent', notes: 'Invoice #62' },
+      { name: 'Maria Jose', status: 'Needs to be sent', notes: 'Invoice #102' }
+      // 4th unit tracked in Stock Overview has no matching client in the raw Batch 11 records — see Data Issues Found.
+    ],
+    'SKU-008': [
+      { name: 'Nathan Collins', status: 'Needs to be sent', notes: 'Invoice #55' },
+      { name: 'Anna Siggs', status: 'Needs to be sent', notes: 'Invoice #63' },
+      { name: 'Dave Kennedy', status: 'Needs to be sent', notes: 'Invoice #64' },
+      { name: 'James McLeod', status: 'Needs to be sent', notes: 'Invoice #65 — paid in full' },
+      { name: 'Jennifer Lauchlan', status: 'Needs to be sent', notes: 'Invoice #72' },
+      { name: 'Johnny Calley', status: 'Needs to be sent', notes: 'Invoice #75' }
+    ],
+    'SKU-004': [
+      { name: 'Sloan McPhee', status: 'Needs to be sent', notes: 'Invoice #106' },
+      { name: 'Blair Turnbull', status: 'Needs to be sent', notes: 'Invoice #96' }
+      // 3rd unit tracked in Stock Overview has no matching client in the raw Batch 11 records — see Data Issues Found.
+    ],
+    'SKU-009': [
+      { name: 'Rachel Croft', status: 'Needs to be sent', notes: 'Invoice #94 — 7-8 person size, verify against SKU-009 vs SKU-008' }
+    ]
+  };
+  const batch11Rows = [TEMPLATE_HEADER_ROW];
+  for (const p of products) {
+    const incoming = (p.incomingBreakdown || []).find((b) => b.batch === 'Batch 11');
+    if (incoming) batch11Rows.push(...templateRowsForProduct(p.sku, p.productName, p.modelSize, incoming.quantity, batch11Prefill[p.sku] || []));
+  }
+  sheets_.push({ title: 'Batch 11 - On Water', rows: batch11Rows, freeze: 1 });
+
+  // --- Next Custom Order --- (blank template, mirrors the console's own bucket)
+  sheets_.push({
+    title: 'Next Custom Order',
+    rows: [TEMPLATE_HEADER_ROW, ['(example)', 'Obsidian Sauna', '4 Person', 'Sam Wilson', '021 555 0123', 'Needs to be sent', 'Deposit paid 10 Sep, not yet placed with manufacturer']],
+    freeze: 1
+  });
+
+  // --- Data Issues Found ---
+  sheets_.push({
+    title: 'Data Issues Found',
+    rows: [
+      ['Issue', 'Detail'],
+      ['Batch 11 has more tracked units than matching client records',
+        'Stock Overview tracks 4 Obsidian 4-Person and 3 Onyx 4-Person incoming on Batch 11. The raw historical batch data only has real client records for 3 and 2 of those respectively — 1 unit of each has no name attached anywhere. Either a real client record is missing from the old sheet, or the tracked count is wrong.'],
+      ['Clients invoiced against Batch 11 whose product isn\'t in Batch 11\'s tracked count at all',
+        'Blair Kirk Properties (Black Nordic Tub + EP1 Chiller) and Mary Hiddleston (Longevity Pro Red Light Sauna) both have real invoices referencing Batch 11, but neither product shows any incoming quantity for Batch 11 in Stock Overview. Either they already shipped and the invoice wasn\'t updated, or the batch tracking never picked them up.'],
+      ['Same invoice number appears in both Batch 10 and Batch 11 source data',
+        'Invoice #73 (Mary Hiddleston) is listed under both batches in the raw historical data — same amount, same date. Needs a human to say which batch it actually belongs to.'],
+      ['One invoice may cover two physical units',
+        'Mary Hiddleston\'s invoice #73 notes mention a second sauna ("one of her saunas is custom traditional in new order") — the raw data has no way to tell if this was ever captured as a separate order.'],
+      ['Deposit + final payment invoices look like duplicate orders in the raw data',
+        'Several Batch 9 clients (e.g. Vee Ozich, Scott Henderson) have two near-identical invoice rows — one Deposit, one Full/Final Payment for the same real order. Already deduplicated in this template\'s prefill, but worth knowing the raw sheet has this pattern throughout.']
+    ],
+    freeze: 1,
+    columnWidths: [420, 720]
+  });
+
+  // --- Checks & Balances (Auto) --- reference only, not for manual entry
+  sheets_.push({
+    title: 'Checks & Balances (Auto)',
+    rows: [
+      ['This tab is NOT for manual entry.'],
+      ['It mirrors the "🔍 Payment Audit Cache" tab that already exists in the live spreadsheet — pipely-xero-agent writes to it automatically every 90 minutes, cross-checking every won deal against real Xero invoice data. The console reads from that cache instead of calling Xero live, which is why pages load fast and the API isn\'t "striking the apps all the time."'],
+      [''],
+      ['Real columns in that tab: Opportunity ID, Deal, Rep, Stage, Deal Value, Contact Email, Has Invoice (Pipely), Invoice Number, Invoice Status, Xero Invoice Number, Xero Status, Xero Amount Due, No Invoice In Xero, Status Mismatch, Not Found In Xero, Check Failed, Check Error, Xero Invoices Summary, Xero Invoices JSON, Total Invoiced To Contact, Stuck Deposit Paid, Xero Deposit Invoice Number, Xero Deposit Amount Paid, Generated At.'],
+      [''],
+      ['If this new spreadsheet becomes the live one, that tab and the background job that writes to it need to be re-pointed at it — a real follow-up task, not something this generator does on its own.']
+    ],
+    columnWidths: [760]
+  });
+
+  return sheets_;
+}
+
+app.post('/admin/generate-template-spreadsheet', async (_req, res) => {
+  try {
+    const sheetDefs = await buildTemplateSheetRequests();
+
+    const created = await sheets.spreadsheets.create({
+      requestBody: {
+        properties: { title: `Everest Plunge — Stock & Allocation Template (${new Date().toISOString().slice(0, 10)})` },
+        sheets: sheetDefs.map((s, i) => ({ properties: { sheetId: i, title: s.title, gridProperties: { frozenRowCount: s.freeze || 0 } } }))
+      }
+    });
+    const spreadsheetId = created.data.spreadsheetId;
+
+    // Write all rows first (values.update per tab).
+    for (let i = 0; i < sheetDefs.length; i++) {
+      const s = sheetDefs[i];
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${s.title}'!A1`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: s.rows }
+      });
+    }
+
+    // Bold + shaded header rows, sensible column widths.
+    const formatRequests = [];
+    sheetDefs.forEach((s, i) => {
+      const headerRowIsTable = s.rows[0] && s.rows[0][0] === 'SKU' || (s.rows[0] && s.rows[0][0] === 'Issue');
+      if (headerRowIsTable) {
+        formatRequests.push({
+          repeatCell: {
+            range: { sheetId: i, startRowIndex: 0, endRowIndex: 1 },
+            cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.89, green: 0.93, blue: 0.91 } } },
+            fields: 'userEnteredFormat(textFormat,backgroundColor)'
+          }
+        });
+      }
+      if (s.columnWidths) {
+        s.columnWidths.forEach((width, colIdx) => {
+          formatRequests.push({
+            updateDimensionProperties: {
+              range: { sheetId: i, dimension: 'COLUMNS', startIndex: colIdx, endIndex: colIdx + 1 },
+              properties: { pixelSize: width },
+              fields: 'pixelSize'
+            }
+          });
+        });
+      }
+    });
+    if (formatRequests.length) {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: formatRequests } });
+    }
+
+    res.json({
+      ok: true,
+      spreadsheetId,
+      url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      tabs: sheetDefs.map((s) => s.title)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3009;
