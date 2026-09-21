@@ -1579,6 +1579,20 @@ app.post('/admin/generate-template-spreadsheet', async (_req, res) => {
   }
 });
 
+// Temporary verification read — confirms the generated template
+// spreadsheet's data actually landed, not just that the API calls didn't
+// throw. Remove alongside the generator above once confirmed.
+app.get('/admin/read-any-sheet', async (req, res) => {
+  const { spreadsheetId, range } = req.query;
+  if (!spreadsheetId || !range) return res.status(400).json({ error: 'spreadsheetId and range query params are required' });
+  try {
+    const result = await sheets.spreadsheets.values.get({ spreadsheetId, range });
+    res.json({ values: result.data.values ?? [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3009;
