@@ -1593,6 +1593,21 @@ app.get('/admin/read-any-sheet', async (req, res) => {
   }
 });
 
+// Temporary — remove once Xavier has confirmed which spreadsheet the console is live on
+app.get('/admin/which-sheet', async (_req, res) => {
+  try {
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.SHEET_ID });
+    res.json({
+      spreadsheetId: process.env.SHEET_ID,
+      title: meta.data.properties.title,
+      url: meta.data.spreadsheetUrl,
+      tabs: meta.data.sheets.map((s) => s.properties.title),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3009;
