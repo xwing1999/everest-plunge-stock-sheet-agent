@@ -1580,6 +1580,120 @@ app.post('/admin/generate-template-spreadsheet', async (_req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// FINALIZE CLEAN SPREADSHEET (added 2026-09-23) — Xavier: "I need the
+// console and new spreadsheet to be completely clear... switch the
+// console to the new template spreadsheet, cleared." The template above
+// covers the human-fill allocation tabs, but the console's actual code
+// (getStockOverview, checkStockAvailability, Log Sale's availability
+// check) reads a completely different, aggregate-count schema from a
+// "📦 Stock Overview" tab — that tab doesn't exist yet in the template
+// spreadsheet. This one-off migration step:
+//   1. Copies the real live Stock Overview tab (exact schema the code
+//      parses: SKU/Product Name/Model-Size/In Stock/Batch N/Available/
+//      New Orders/Balance columns) from the OLD live spreadsheet into the
+//      NEW template spreadsheet, under the identical tab name — so
+//      whatever STOCK_OVERVIEW_TAB is already configured to on Railway
+//      keeps working with zero env var change needed. Real current
+//      quantities, not reset to zero — "current existing stock" is
+//      current state, not something to blank out.
+//   2. Clears the Batch 11/12 historical customer-name prefill in the
+//      template's own allocation tabs back to genuinely blank ("Available
+//      — not yet allocated"), per Xavier's explicit choice — real
+//      quantities/SKUs stay, who-it's-promised-to starts fresh.
+//   3. Rewrites "How To Use" to describe the two live API-backed tabs
+//      (Stock Overview, Automation Log — the latter auto-creates empty on
+//      first Log Sale) instead of the old "some rows are pre-filled" text.
+// Does NOT touch the old live spreadsheet at all — reads from it once,
+// writes nothing back. Does NOT flip SHEET_ID itself — that's a separate,
+// deliberate step once this is confirmed to have landed correctly.
+// Temporary, one-off endpoint — remove once run and confirmed.
+// ---------------------------------------------------------------------------
+const MIGRATION_OLD_SHEET_ID = '1wzbYBqi-cb2kDvwGs5S30VN25QLi0QOc8_qKilmfQVw';
+const MIGRATION_NEW_SHEET_ID = '1LBwPSjiJ-ijO9teLwXbtFirWDcDNWLmd0DKadKSGFnI';
+const MIGRATION_STOCK_OVERVIEW_TAB = '📦 Stock Overview_13.08.2026';
+
+app.post('/admin/finalize-clean-spreadsheet', async (_req, res) => {
+  try {
+    const result = { steps: [] };
+
+    // 1. Copy the real live Stock Overview tab verbatim into the new sheet.
+    const oldStockRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: MIGRATION_OLD_SHEET_ID,
+      range: MIGRATION_STOCK_OVERVIEW_TAB
+    });
+    const stockRows = oldStockRes.data.values ?? [];
+    if (!stockRows.length) throw new Error('Old Stock Overview tab came back empty — aborting before writing anything.');
+
+    const newMeta = await sheets.spreadsheets.get({ spreadsheetId: MIGRATION_NEW_SHEET_ID });
+    const alreadyHasStockTab = newMeta.data.sheets.some((s) => s.properties.title === MIGRATION_STOCK_OVERVIEW_TAB);
+    if (!alreadyHasStockTab) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: MIGRATION_NEW_SHEET_ID,
+        requestBody: { requests: [{ addSheet: { properties: { title: MIGRATION_STOCK_OVERVIEW_TAB, gridProperties: { frozenRowCount: 4 } } } }] }
+      });
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: MIGRATION_NEW_SHEET_ID,
+      range: `'${MIGRATION_STOCK_OVERVIEW_TAB}'!A1`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: stockRows }
+    });
+    result.steps.push({ step: 'copy-stock-overview', rowsCopied: stockRows.length });
+
+    // 2. Clear Batch 11/12 prefill in the new sheet's own allocation tabs.
+    for (const tabName of ['Batch 11 - On Water', 'Batch 12 - On Water']) {
+      const tabRes = await sheets.spreadsheets.values.get({ spreadsheetId: MIGRATION_NEW_SHEET_ID, range: tabName });
+      const rows = tabRes.data.values ?? [];
+      const dataRowCount = Math.max(0, rows.length - 1); // minus header
+      if (dataRowCount > 0) {
+        const blanked = Array.from({ length: dataRowCount }, () => ['', '', 'Available — not yet allocated', '']);
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: MIGRATION_NEW_SHEET_ID,
+          range: `'${tabName}'!D2:G${dataRowCount + 1}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: blanked }
+        });
+      }
+      result.steps.push({ step: `clear-prefill:${tabName}`, rowsCleared: dataRowCount });
+    }
+
+    // 3. Rewrite "How To Use" for the post-migration state.
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: MIGRATION_NEW_SHEET_ID,
+      range: `'How To Use'!A1`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [
+          ['Everest Plunge — Stock & Allocation Tracker'],
+          [''],
+          ['What this is'],
+          ['One row per physical unit, not an aggregate count. If a sauna is sold and waiting to ship, it gets its own row with the customer\'s name and contact next to it — not just a number.'],
+          [''],
+          ['How to use it'],
+          ['- "Stock On Shore": every unit physically in the Silverdale/Auckland warehouse right now. Fill in Allocated To / Contact / Status as units get promised to a client. Blank rows are "Available".'],
+          ['- "Batch 11/12 — On Water": units already ordered and on the water for that shipment. All rows start blank — fill in Allocated To / Contact / Status as units get promised. Real quantities per batch are accurate as of the last scan.'],
+          ['- "Next Custom Order": deals that are sold but not yet placed with the manufacturer at all.'],
+          [`- "${MIGRATION_STOCK_OVERVIEW_TAB}": the real aggregate stock counter the console's code actually reads from (In Stock / Reserved / Available / Balance per SKU, per batch). Update In Stock and the Batch N columns by hand as physical stock moves — Available/Balance are meant to reflect those.`],
+          ['- "🤖 Automation Log": every deal logged through the console\'s Log Sale page lands here automatically. Starts empty — "we will just do jobs moving forward," historical deals are not backfilled into this tab.'],
+          ['- "🔍 Payment Audit Cache": NOT for manual entry. pipely-xero-agent writes here automatically every 90 minutes, cross-checking every won deal against real Xero invoice data. Starts empty until the first scan after this sheet goes live.'],
+          ['- "Data Issues Found": real mismatches found in the OLD spreadsheet\'s historical batch records, kept for reference only — not something this sheet needs resolved before use.'],
+          [''],
+          ['Status values to use'],
+          ['Available — not yet allocated  |  Needs to be sent  |  Shipped  |  On hold'],
+          [''],
+          [`Cleared and finalized ${new Date().toISOString().slice(0, 10)} — real quantities kept, all customer/allocation data starts blank.`]
+        ]
+      }
+    });
+    result.steps.push({ step: 'rewrite-how-to-use' });
+
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Temporary verification read — confirms the generated template
 // spreadsheet's data actually landed, not just that the API calls didn't
 // throw. Remove alongside the generator above once confirmed.
