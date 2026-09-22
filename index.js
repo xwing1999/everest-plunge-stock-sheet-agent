@@ -678,6 +678,7 @@ function deriveOrderStatus(entry) {
   if (entry['Order Sent Date']) return 'Sent';
   if (entry['Allocation'] === 'On Shore') return 'Ready to organise';
   if (entry['Allocation'] === 'On Water') return 'Awaiting stock (on water)';
+  if (entry['Allocation'] === 'In Production') return 'Awaiting stock (in production)';
   if (entry['Allocation'] === 'Next Custom Order') return 'Awaiting stock (not yet ordered)';
   return 'Unallocated';
 }
@@ -1588,21 +1589,6 @@ app.get('/admin/read-any-sheet', async (req, res) => {
   try {
     const result = await sheets.spreadsheets.values.get({ spreadsheetId, range });
     res.json({ values: result.data.values ?? [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Temporary — remove once Xavier has confirmed which spreadsheet the console is live on
-app.get('/admin/which-sheet', async (_req, res) => {
-  try {
-    const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.SHEET_ID });
-    res.json({
-      spreadsheetId: process.env.SHEET_ID,
-      title: meta.data.properties.title,
-      url: meta.data.spreadsheetUrl,
-      tabs: meta.data.sheets.map((s) => s.properties.title),
-    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
