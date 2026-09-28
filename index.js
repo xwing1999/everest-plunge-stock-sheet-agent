@@ -2064,7 +2064,7 @@ app.post('/admin/mark-order-placed', async (req, res) => {
 // treats as 0. Refuses to touch an existing SKU rather than risk
 // duplicating or clobbering real inventory data.
 // ---------------------------------------------------------------------------
-async function addStockProduct({ sku, productName, modelSize, inStock }) {
+async function addStockProduct({ sku, productName, modelSize, inStock, retailPrice }) {
   await refreshStockOverviewTab();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
@@ -2092,6 +2092,8 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
   newRow[idx.productName] = productName;
   newRow[idx.modelSize] = modelSize ?? '';
   newRow[idx.inStock] = inStock ?? 0;
+  const priceIdx = headers.findIndex((h) => h.toUpperCase().startsWith('RETAIL'));
+  if (priceIdx !== -1 && retailPrice != null && retailPrice !== '') newRow[priceIdx] = Number(retailPrice);
 
   // NOT values.append — a real bug found 2026-09-17: the real sheet has a
   // TOTALS row (or a blank-SKU row) after the last real product, and
@@ -2179,10 +2181,10 @@ app.post('/admin/assign-stock-sku', async (req, res) => {
 });
 
 app.post('/admin/add-stock-product', async (req, res) => {
-  const { sku, productName, modelSize, inStock } = req.body;
+  const { sku, productName, modelSize, inStock, retailPrice } = req.body;
   if (!sku || !productName) return res.status(400).json({ error: 'sku and productName are required' });
   try {
-    res.json({ ok: true, ...(await addStockProduct({ sku, productName, modelSize, inStock: Number(inStock) || 0 })) });
+    res.json({ ok: true, ...(await addStockProduct({ sku, productName, modelSize, inStock: Number(inStock) || 0, retailPrice })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
