@@ -818,7 +818,7 @@ async function setLogFields(headers, entry, fields) {
   });
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: process.env.SHEET_ID,
-    requestBody: { valueInputOption: 'USER_ENTERED', data }
+    requestBody: { valueInputOption: 'RAW', data }
   });
 }
 
@@ -1143,6 +1143,49 @@ async function renameBatch({ tabName, newBatchReference }) {
   });
 }
 
+// Rename a product everywhere it appears (2026-09-28 — "Traditional Sauna"
+// was a category label, not a product): its Stock Overview row, every unit
+// row with that SKU (including Shipped), and the Product name on its deals.
+// Written RAW so a size like "- EP1 Chiller" isn't parsed as a formula.
+async function renameProduct({ sku, productName, modelSize }) {
+  if (!sku || !productName) throw new Error('sku and productName are required.');
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const changed = { overview: 0, units: 0, deals: 0 };
+    await refreshStockOverviewTab();
+    const ov = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: stockOverviewTab });
+    const rows = ov.data.values ?? [];
+    const h = rows.findIndex((r) => (r[0] ?? '').toString().trim().toUpperCase() === 'SKU');
+    if (h !== -1) {
+      const headers = rows[h].map((x) => (x ?? '').toString().trim().toUpperCase());
+      const nameCol = headers.indexOf('PRODUCT NAME'), sizeCol = headers.findIndex((x) => x.startsWith('MODEL'));
+      for (let r = h + 1; r < rows.length; r++) {
+        if ((rows[r][0] ?? '').toString().trim() !== sku) continue;
+        const data = [{ range: `'${stockOverviewTab}'!${columnIndexToLetter(nameCol)}${r + 1}`, values: [[productName]] }];
+        if (modelSize !== undefined && sizeCol !== -1) data.push({ range: `'${stockOverviewTab}'!${columnIndexToLetter(sizeCol)}${r + 1}`, values: [[modelSize]] });
+        await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: process.env.SHEET_ID, requestBody: { valueInputOption: 'RAW', data } });
+        changed.overview++;
+      }
+    }
+    const titles = (await getSheetMeta()).map((s) => s.properties.title).filter((t) => isLiveUnitTab(t) || t === SHIPPED_TAB);
+    for (const tabName of titles) {
+      const { units } = await readUnitRows(tabName);
+      const mine = units.filter((u) => u.row[0].trim() === sku);
+      if (!mine.length) continue;
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: process.env.SHEET_ID,
+        requestBody: { valueInputOption: 'RAW', data: mine.map((u) => ({ range: `'${tabName}'!B${u.index + 1}:C${u.index + 1}`, values: [[productName, modelSize ?? u.row[2]]] })) }
+      });
+      changed.units += mine.length;
+    }
+    const log = await getAutomationLogRows();
+    for (const e of log.entries.filter((x) => x['SKU'] === sku)) {
+      await setLogFields(log.headers, e, { 'Product': productName });
+      changed.deals++;
+    }
+    return { sku, productName, modelSize, ...changed, customerName: `${changed.units} unit(s), ${changed.deals} deal(s) renamed` };
+  });
+}
+
 // Edit the details written on a unit row (name, contact, status, notes).
 const UNIT_EDITABLE = { allocatedTo: 3, contact: 4, status: 5, notes: 6 };
 async function updateUnit({ tabName, rowNumber, sku, orderId, fields }) {
@@ -1215,7 +1258,7 @@ async function logSoldDeal({ source, externalRef, customerName, email, phone, fr
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SHEET_ID,
     range: `'${AUTOMATION_LOG_TAB}'!A:A`,
-    valueInputOption: 'USER_ENTERED',
+    valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values: [row] }
   });
@@ -1327,7 +1370,7 @@ async function editDealDetails(orderId, fields) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
     range: `'${AUTOMATION_LOG_TAB}'!A${entry.rowNumber}:${lastCol}${entry.rowNumber}`,
-    valueInputOption: 'USER_ENTERED',
+    valueInputOption: 'RAW',
     requestBody: { values: [row] }
   });
 
@@ -1913,10 +1956,10 @@ async function appendStockHistory(row) {
   });
 }
 
-const HISTORY_ACTION = { 'add-units': 'Added units', 'remove-units': 'Removed units', 'unassign-unit': 'Unassigned customer', 'assign-unit': 'Assigned customer', 'update-unit': 'Edited unit details', 'rename-batch': 'Renamed batch' };
+const HISTORY_ACTION = { 'add-units': 'Added units', 'remove-units': 'Removed units', 'unassign-unit': 'Unassigned customer', 'assign-unit': 'Assigned customer', 'update-unit': 'Edited unit details', 'rename-batch': 'Renamed batch', 'rename-product': 'Renamed product' };
 
 // Manual stock / unit editing — see the MANUAL STOCK / UNIT EDITING block.
-for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit], ['rename-batch', renameBatch]]) {
+for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit], ['rename-batch', renameBatch], ['rename-product', renameProduct]]) {
   app.post(`/admin/${route}`, async (req, res) => {
     const body = req.body || {};
     const who = (body.who || '').toString().trim();
@@ -1934,7 +1977,7 @@ for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits
           'Quantity': result.added ?? result.removed ?? (route === 'add-units' || route === 'remove-units' ? body.quantity : 1),
           'Customer / Order': [result.customerName || result.freed || '', body.orderId || ''].filter(Boolean).join(' · '),
           'Reason': reason,
-          'Details': route === 'rename-batch' ? `${result.oldName} → ${result.newName}` : route === 'update-unit' ? JSON.stringify(body.fields || {}) : (body.rowNumber ? `Row ${body.rowNumber}` : '')
+          'Details': route === 'rename-product' ? `${body.sku} → ${body.productName} ${body.modelSize || ''}` : route === 'rename-batch' ? `${result.oldName} → ${result.newName}` : route === 'update-unit' ? JSON.stringify(body.fields || {}) : (body.rowNumber ? `Row ${body.rowNumber}` : '')
         });
       } catch (err) {
         result.historyWarning = `Change made, but writing the Stock History row failed: ${err.message}`;
