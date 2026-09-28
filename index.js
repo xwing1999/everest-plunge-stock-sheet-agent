@@ -19,7 +19,10 @@ app.use(express.json());
 const locks = new Map();
 function withLock(key, fn) {
   const prevTail = locks.get(key) || Promise.resolve();
-  const run = prevTail.then(fn, fn);
+  // Every locked operation is a read-modify-write, so it must read the
+  // sheet fresh, never from the short read cache (defined below).
+  const fresh = () => { readCache.clear(); return fn(); };
+  const run = prevTail.then(fresh, fresh);
   locks.set(key, run.then(() => {}, () => {}));
   return run;
 }
@@ -52,6 +55,41 @@ if (process.env.GOOGLE_REFRESH_TOKEN) {
   oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 }
 const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+
+// ---------------------------------------------------------------------------
+// READ CACHE (2026-09-28) — every console page fans out into many Sheets
+// reads (metadata + one per tab), and a few people using it at once hit
+// Google's "read requests per minute per user" quota: pages showed
+// "Quota exceeded". Reads are cached for a few seconds and identical
+// in-flight reads are shared; ANY write clears the whole cache first, so
+// nothing reads back stale data after a change made through this service.
+// Edits typed straight into the sheet show up within READ_CACHE_MS.
+// ---------------------------------------------------------------------------
+const READ_CACHE_MS = Number(process.env.READ_CACHE_MS ?? 15000);
+const readCache = new Map();
+function cachedRead(resource, method) {
+  const raw = resource[method].bind(resource);
+  resource[method] = (params, ...rest) => {
+    const key = `${method}:${JSON.stringify(params)}`;
+    const hit = readCache.get(key);
+    if (hit && Date.now() - hit.at < READ_CACHE_MS) return hit.promise;
+    const promise = raw(params, ...rest);
+    readCache.set(key, { at: Date.now(), promise });
+    promise.catch(() => readCache.delete(key));
+    return promise;
+  };
+}
+function invalidatingWrite(resource, method) {
+  const raw = resource[method].bind(resource);
+  resource[method] = async (...args) => {
+    readCache.clear();
+    try { return await raw(...args); } finally { readCache.clear(); }
+  };
+}
+cachedRead(sheets.spreadsheets, 'get');
+cachedRead(sheets.spreadsheets.values, 'get');
+invalidatingWrite(sheets.spreadsheets, 'batchUpdate');
+for (const m of ['update', 'append', 'batchUpdate', 'clear']) invalidatingWrite(sheets.spreadsheets.values, m);
 
 app.get('/oauth/start', (_req, res) => {
   const url = oauth2Client.generateAuthUrl({
