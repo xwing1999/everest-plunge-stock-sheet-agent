@@ -521,7 +521,8 @@ const AUTOMATION_LOG_HEADERS = [
   'Final Payment Status', 'Ship Target Date',
   'Allocation', 'Batch Reference', 'Expected Date', 'Order Placed',
   'Courier', 'Tracking #', 'Order Sent Date', 'Notes',
-  'Phone' // added 2026-09-28 (courier booking needs it) — kept last so existing rows' columns don't shift
+  'Phone', // added 2026-09-28 (courier booking needs it) — kept last so existing rows' columns don't shift
+  'Freight Sold' // added 2026-09-28 — freight amount charged to the customer, for reference
 ];
 
 async function ensureAutomationLogTab() {
@@ -1000,7 +1001,7 @@ async function getUnitStock() {
   return { tabs };
 }
 
-async function logSoldDeal({ source, externalRef, customerName, email, phone, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
+async function logSoldDeal({ source, externalRef, customerName, email, phone, freightSold, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, soldDate }) {
   await ensureAutomationLogTab();
 
   const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1026,7 +1027,7 @@ async function logSoldDeal({ source, externalRef, customerName, email, phone, sk
   const row = [
     orderId,
     externalRef || '',
-    new Date().toISOString(),
+    soldDate || new Date().toISOString(), // soldDate: original sale date when importing past deals
     source || 'Manual',
     customerName || '',
     email || '',
@@ -1045,7 +1046,8 @@ async function logSoldDeal({ source, externalRef, customerName, email, phone, sk
     '', // Order Placed — only meaningful for Next Custom Order rows, see markOrderPlaced
     '', '', '', // Courier, Tracking #, Order Sent Date — filled in later via markOrderSent
     notes || '',
-    phone || ''
+    phone || '',
+    freightSold ?? ''
   ];
 
   await sheets.spreadsheets.values.append({
@@ -1112,7 +1114,8 @@ const EDITABLE_DEAL_FIELDS = {
   batchReference: 'Batch Reference',
   expectedDate: 'Expected Date',
   notes: 'Notes',
-  phone: 'Phone'
+  phone: 'Phone',
+  freightSold: 'Freight Sold'
 };
 
 async function editDealDetails(orderId, fields) {
@@ -1605,7 +1608,7 @@ app.get('/admin/automation-log', async (_req, res) => {
 app.post('/admin/log-sold-deal', async (req, res) => {
   const {
     source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone
+    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate
   } = req.body;
   if (!customerName) return res.status(400).json({ error: 'customerName is required' });
   try {
@@ -1613,7 +1616,7 @@ app.post('/admin/log-sold-deal', async (req, res) => {
       ok: true,
       ...(await logSoldDeal({
         source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone
+        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate
       }))
     });
   } catch (err) {
