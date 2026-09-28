@@ -829,7 +829,13 @@ async function setLogFields(headers, entry, fields) {
 // assigned to later. Rows are written to the new tab BEFORE being deleted
 // from Next Custom Order, so a failure part-way leaves a duplicate to tidy,
 // never a lost customer.
-async function startProductionBatch({ batchReference, items }) {
+async function startProductionBatch({ batchReference, items, stage = 'In Production', pullFromQueue = true, pullOrderIds = null }) {
+  // Generalised 2026-09-28 ("start new batches if we need"): a batch can be
+  // created straight into On Water (already shipped) as well as In
+  // Production, and waiting customers can be pulled onto it — all by SKU
+  // (default), only the named order IDs, or none.
+  if (!['In Production', 'On Water'].includes(stage)) throw new Error('stage must be "In Production" or "On Water".');
+  const pullSet = Array.isArray(pullOrderIds) && pullOrderIds.length ? new Set(pullOrderIds) : null;
   const digits = batchDigits(batchReference);
   if (!digits) throw new Error('batchReference must contain a batch number, e.g. "Batch 13".');
   const lines = (items || []).map((i) => ({ sku: (i.sku || '').trim(), quantity: Number(i.quantity) }));
@@ -839,10 +845,13 @@ async function startProductionBatch({ batchReference, items }) {
 
   return withLock(UNIT_TABS_LOCK, async () => {
     const sheetsMeta = await getSheetMeta();
-    if (findBatchTab(sheetsMeta, /on water/i, digits)) {
-      throw new Error(`Batch ${digits} is already on the water — it can't take new production units.`);
+    const stagePattern = stage === 'On Water' ? /on water/i : /in production/i;
+    const otherPattern = stage === 'On Water' ? /in production/i : /on water/i;
+    const other = findBatchTab(sheetsMeta, otherPattern, digits);
+    if (other) {
+      throw new Error(`Batch ${digits} already exists as "${other.title}" — add units to it there, or rename one of them first.`);
     }
-    const tabName = findBatchTab(sheetsMeta, /in production/i, digits)?.title || `Batch ${digits} - In Production`;
+    const tabName = findBatchTab(sheetsMeta, stagePattern, digits)?.title || `Batch ${digits} - ${stage}`;
     await ensureUnitTab(tabName);
 
     const overview = await getStockOverview();
@@ -857,7 +866,8 @@ async function startProductionBatch({ batchReference, items }) {
       const product = overview.products.find((p) => p.sku === sku);
       // A waiting customer is any row with an Order ID (logged via the
       // console) or a name typed straight into the sheet.
-      const queue = waiting.filter((u) => u.row[0].trim() === sku && (u.row[7].trim() || u.row[3].trim()) && !taken.has(u.index));
+      const queue = !pullFromQueue ? [] : waiting.filter((u) => u.row[0].trim() === sku && (u.row[7].trim() || u.row[3].trim()) && !taken.has(u.index)
+        && (!pullSet || pullSet.has(u.row[7].trim())));
       let assigned = 0;
       for (let i = 0; i < quantity; i++) {
         const u = queue[i];
@@ -892,7 +902,7 @@ async function startProductionBatch({ batchReference, items }) {
       const entry = log.entries.find((e) => e['Order ID'] === orderId);
       if (!entry) continue;
       if (stillWaitingByOrder[orderId]) { splitOrders.push(orderId); continue; }
-      await setLogFields(log.headers, entry, { 'Allocation': 'In Production', 'Batch Reference': `Batch ${digits}`, 'Order Placed': 'TRUE' });
+      await setLogFields(log.headers, entry, { 'Allocation': stage, 'Batch Reference': `Batch ${digits}`, 'Order Placed': 'TRUE' });
     }
 
     return { tabName, summary, ordersMovedToProduction: [...movedOrders].filter((id) => !splitOrders.includes(id)), splitOrders };
@@ -1101,6 +1111,35 @@ async function assignUnit({ tabName, rowNumber, sku, orderId }) {
     if (!entry['SKU']) fields['SKU'] = u.row[0].trim();
     await setLogFields(log.headers, entry, fields);
     return { tabName, rowNumber: Number(rowNumber), orderId, customerName: entry['Customer Name'] };
+  });
+}
+
+// Rename a batch (e.g. "Batch 12" -> "Batch 14"): renames its tab and
+// repoints every deal and the batch ETA from the old number to the new one.
+async function renameBatch({ tabName, newBatchReference }) {
+  const newDigits = batchDigits(newBatchReference);
+  if (!newDigits) throw new Error('New batch name must contain a number, e.g. "Batch 14".');
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const meta = await getSheetMeta();
+    const tab = meta.find((s) => s.properties.title === tabName)?.properties;
+    if (!tab || !/on water|in production/i.test(tabName)) throw new Error(`"${tabName}" isn't a batch tab.`);
+    const oldDigits = batchDigits(tabName);
+    if (oldDigits === newDigits) throw new Error('That is already the batch number.');
+    const clash = meta.find((s) => /on water|in production/i.test(s.properties.title) && batchDigits(s.properties.title) === newDigits);
+    if (clash) throw new Error(`"${clash.properties.title}" already exists — pick a different number.`);
+    const stage = /on water/i.test(tabName) ? 'On Water' : 'In Production';
+    const newTitle = `Batch ${newDigits} - ${stage}`;
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: { requests: [{ updateSheetProperties: { properties: { sheetId: tab.sheetId, title: newTitle }, fields: 'title' } }] }
+    });
+    const log = await getAutomationLogRows();
+    const moved = log.entries.filter((e) => !e['Order Sent Date'] && batchDigits(e['Batch Reference']) === oldDigits);
+    for (const e of moved) await setLogFields(log.headers, e, { 'Batch Reference': `Batch ${newDigits}` });
+    const etas = loadBatchEtas();
+    const etaKey = Object.keys(etas).find((k) => batchDigits(k) === oldDigits);
+    if (etaKey) { etas[`Batch ${newDigits}`] = etas[etaKey]; delete etas[etaKey]; saveBatchEtas(etas); }
+    return { oldName: tabName, newName: newTitle, dealsUpdated: moved.length, customerName: `${moved.length} deal(s) repointed` };
   });
 }
 
@@ -1874,10 +1913,10 @@ async function appendStockHistory(row) {
   });
 }
 
-const HISTORY_ACTION = { 'add-units': 'Added units', 'remove-units': 'Removed units', 'unassign-unit': 'Unassigned customer', 'assign-unit': 'Assigned customer', 'update-unit': 'Edited unit details' };
+const HISTORY_ACTION = { 'add-units': 'Added units', 'remove-units': 'Removed units', 'unassign-unit': 'Unassigned customer', 'assign-unit': 'Assigned customer', 'update-unit': 'Edited unit details', 'rename-batch': 'Renamed batch' };
 
 // Manual stock / unit editing — see the MANUAL STOCK / UNIT EDITING block.
-for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit]]) {
+for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit], ['rename-batch', renameBatch]]) {
   app.post(`/admin/${route}`, async (req, res) => {
     const body = req.body || {};
     const who = (body.who || '').toString().trim();
@@ -1895,7 +1934,7 @@ for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits
           'Quantity': result.added ?? result.removed ?? (route === 'add-units' || route === 'remove-units' ? body.quantity : 1),
           'Customer / Order': [result.customerName || result.freed || '', body.orderId || ''].filter(Boolean).join(' · '),
           'Reason': reason,
-          'Details': route === 'update-unit' ? JSON.stringify(body.fields || {}) : (body.rowNumber ? `Row ${body.rowNumber}` : '')
+          'Details': route === 'rename-batch' ? `${result.oldName} → ${result.newName}` : route === 'update-unit' ? JSON.stringify(body.fields || {}) : (body.rowNumber ? `Row ${body.rowNumber}` : '')
         });
       } catch (err) {
         result.historyWarning = `Change made, but writing the Stock History row failed: ${err.message}`;
@@ -1922,9 +1961,18 @@ app.get('/admin/stock-history', async (req, res) => {
 
 // Stage moves for per-unit tracking — see the EVERY UNIT, EVERY STAGE block.
 app.post('/admin/start-production-batch', async (req, res) => {
-  const { batchReference, items } = req.body;
+  const { batchReference, items, stage, pullFromQueue, pullOrderIds, who, reason } = req.body;
   try {
-    res.json({ ok: true, ...(await startProductionBatch({ batchReference, items })) });
+    const result = await startProductionBatch({ batchReference, items, stage: stage || 'In Production', pullFromQueue: pullFromQueue !== false, pullOrderIds });
+    if (who) {
+      await appendStockHistory({
+        'Timestamp': new Date().toISOString(), 'Who': who, 'Action': 'Created / added to batch', 'Location': result.tabName,
+        'SKU': (items || []).map((i) => i.sku).join(', '), 'Quantity': (items || []).reduce((n, i) => n + Number(i.quantity || 0), 0),
+        'Customer / Order': `${result.ordersMovedToProduction.length} customer(s) moved from Next Custom Order`, 'Reason': reason || '',
+        'Details': JSON.stringify(result.summary)
+      }).catch((err) => { result.historyWarning = err.message; });
+    }
+    res.json({ ok: true, ...result });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
