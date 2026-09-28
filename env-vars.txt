@@ -28,7 +28,14 @@ GOOGLE_REFRESH_TOKEN=
 # spreadsheet still only exists as the .xlsx download, upload/convert it to
 # Google Sheets first and share edit access with whichever Google account
 # you authorize this agent with in /oauth/start.
-SHEET_ID=
+#
+# LIVE SHEET (switched 2026-09-25) — this is the spreadsheet the ops console
+# actually reads/writes. Share THIS one with the team:
+#   https://docs.google.com/spreadsheets/d/1LBwPSjiJ-ijO9teLwXbtFirWDcDNWLmd0DKadKSGFnI/edit
+# The OLD sheet (1wzbYBqi-cb2kDvwGs5S30VN25QLi0QOc8_qKilmfQVw, the converted
+# Everest Plunge_Operations_v2.xlsx) is archive only — nothing writes to it.
+# If you ever change SHEET_ID in Railway, update these lines in the same step.
+SHEET_ID=1LBwPSjiJ-ijO9teLwXbtFirWDcDNWLmd0DKadKSGFnI
 
 # Confirmed real tab name (as of the 2026-08-13 export) — includes the
 # emoji, same convention as the batch tabs. Change only if you've actually

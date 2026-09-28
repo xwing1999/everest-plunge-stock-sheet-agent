@@ -4,6 +4,18 @@ Automates writes to Everest Plunge's stock & fulfillment Google Sheet (the
 per-batch client allocation tracker — batch tabs like "BATCH 12", each with
 a product anchor row and stacked client rows above a "↳ Remaining" row).
 
+## Live spreadsheet — the one the ops console uses
+**https://docs.google.com/spreadsheets/d/1LBwPSjiJ-ijO9teLwXbtFirWDcDNWLmd0DKadKSGFnI/edit**
+(the simplified Stock & Allocation sheet; `SHEET_ID` switched to it
+2026-09-25). This is the sheet to share with the team.
+
+The old sheet (`1wzbYBqi-cb2kDvwGs5S30VN25QLi0QOc8_qKilmfQVw`, converted
+from `Everest Plunge_Operations_v2.xlsx`) is **archive only** — nothing
+reads or writes it any more. Some sections below were written against the
+old sheet's layout (BATCH 9–12 tabs, etc.) and may describe tabs that no
+longer exist in the live one. If `SHEET_ID` changes in Railway, update this
+section and `env-vars.txt` in the same step.
+
 **2026-08-31 — audit fixes**: `recordNewOrderAgainstBatch` is now locked
 per-SKU (was a non-atomic read-modify-write that could silently lose an
 increment under concurrent calls), `/admin/set-final-payment-status`
