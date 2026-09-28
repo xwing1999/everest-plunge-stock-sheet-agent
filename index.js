@@ -526,11 +526,70 @@ async function getAutomationLogRows() {
 // allocated" and claims a new one under the new details, so the magnet
 // actually moves instead of leaving a stale claim behind.
 //
-// "In Production" has no per-unit tab yet (units aren't individually
-// distinguishable while still being manufactured) — nothing to claim there,
-// by design, not an oversight.
+// EVERY UNIT, EVERY STAGE (2026-09-28) — Xavier: "every single item gets
+// its own row so even if it's in production it can still be assigned...
+// whether it's a batch on water, whether it's stock on shore, whether it's
+// the next custom order." And from 2026-09-25: a custom order "goes from in
+// production to on water to in the warehouse - then to needing to be booked
+// for dispatch", with the client's magnet following the unit the whole way.
+// He chose separate tabs per stage (over one Units tab with a Stage column)
+// so each tab reads as a clear report: what's in that location, what's
+// allocated, what's free.
+//
+// Tabs, in stage order — each row is ONE physical unit:
+//   Next Custom Order          sold, not yet ordered from the manufacturer
+//   Batch N - In Production    ordered, being manufactured (startProductionBatch creates it)
+//   Batch N - On Water         shipped (markBatchShipped renames the In Production tab)
+//   Stock On Shore             landed (markBatchArrived moves rows in, deletes the emptied On Water tab)
+//                              "Needs to be sent" status here = ready to book for dispatch
+//   Shipped                    sent to the customer (markOrderSent moves rows in)
+//
+// Every mutation of these tabs runs under ONE shared lock (UNIT_TABS_LOCK)
+// so two concurrent claims can't grab the same free row. The helpers below
+// take no lock themselves — only top-level operations do, since withLock on
+// the same key from inside a locked call would deadlock.
+//
+// Does NOT touch Stock Overview's aggregate counters — those stay a manual
+// step in that tab, same as before this change.
 // ---------------------------------------------------------------------------
 const UNIT_TAB_HEADERS = ['SKU', 'Product', 'Model / Size', 'Allocated To', 'Contact', 'Status', 'Notes', 'Order ID'];
+const UNIT_TABS_LOCK = 'unit-tabs';
+const AVAILABLE_STATUS = 'Available — not yet allocated';
+const ON_SHORE_TAB = 'Stock On Shore';
+const NEXT_CUSTOM_ORDER_TAB = 'Next Custom Order';
+const SHIPPED_TAB = 'Shipped';
+
+// Unit tabs a claimed order can be released from. Shipped is deliberately
+// excluded — a unit that's physically left the warehouse isn't reassignable.
+function isLiveUnitTab(title) {
+  return title === ON_SHORE_TAB || title === NEXT_CUSTOM_ORDER_TAB || /on water|in production/i.test(title);
+}
+
+function batchDigits(batchReference) {
+  return ((batchReference || '').toString().match(/\d+/) || [])[0] || null;
+}
+
+// Batch Reference is free text a human typed ("Batch 12", "batch12") —
+// matched against real tab titles by batch number alone.
+function findBatchTab(sheetsMeta, stagePattern, digits) {
+  if (!digits) return null;
+  const match = sheetsMeta.find((s) => {
+    const title = s.properties.title;
+    return stagePattern.test(title) && new RegExp(`\\bbatch\\s*${digits}\\b`, 'i').test(title);
+  });
+  return match ? match.properties : null;
+}
+
+async function ensureUnitTab(tabName) {
+  const sheetsMeta = await getSheetMeta();
+  if (!sheetsMeta.some((s) => s.properties.title === tabName)) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: tabName, gridProperties: { frozenRowCount: 1 } } } }] }
+    });
+  }
+  await ensureUnitTabHeader(tabName);
+}
 
 async function ensureUnitTabHeader(tabName) {
   const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: `'${tabName}'!A1:H1` });
@@ -544,111 +603,281 @@ async function ensureUnitTabHeader(tabName) {
   });
 }
 
-// Batch Reference is free text a human typed into Log Sale (e.g. "Batch
-// 12", "batch12") — matched loosely against real tab titles by the batch
-// number alone, not an exact string, since the real tab is "Batch 12 - On
-// Water".
-async function resolveUnitTabName(allocation, batchReference) {
-  if (allocation === 'On Shore') return 'Stock On Shore';
-  if (allocation === 'Next Custom Order') return 'Next Custom Order';
-  if (allocation === 'On Water') {
-    const digits = ((batchReference || '').match(/\d+/) || [])[0];
-    if (!digits) return null;
-    const sheetsMeta = await getSheetMeta();
-    const match = sheetsMeta.find((s) => {
-      const title = s.properties.title;
-      return /on water/i.test(title) && new RegExp(`\\bbatch\\s*${digits}\\b`, 'i').test(title);
-    });
-    return match ? match.properties.title : null;
-  }
-  return null; // In Production, or no/unknown allocation — nothing to claim
-}
-
-async function claimUnitForOrder(tabName, sku, orderId, customerName, contact) {
-  if (!tabName || !sku) return { claimed: false, reason: 'No matching unit tab or SKU to claim against.' };
-  await ensureUnitTabHeader(tabName);
-
-  // "Next Custom Order" is an open-ended queue, not a fixed pool of real
-  // units — there's no pre-existing blank row to find for a SKU that
-  // hasn't been ordered yet, so claiming here means ADDING a row, not
-  // searching for one.
-  if (tabName === 'Next Custom Order') {
-    const overview = await getStockOverview();
-    const product = overview.products.find((p) => p.sku === sku);
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `'${tabName}'!A:A`,
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [[sku, product?.productName || '', product?.modelSize || '', customerName || '', contact || '', 'Needs to be sent', `Order ${orderId}`, orderId]] }
-    });
-    return { claimed: true, tabName, sku };
-  }
-
+// Returns every unit row below the SKU header, each with its 0-based sheet
+// row index (what deleteDimension wants; +1 for A1 notation).
+async function readUnitRows(tabName) {
   const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: tabName });
   const rows = res.data.values ?? [];
   const headerIdx = rows.findIndex((r) => (r[0] ?? '').toString().trim().toUpperCase() === 'SKU');
-  if (headerIdx === -1) return { claimed: false, reason: `"${tabName}" has no SKU header row.` };
-
+  if (headerIdx === -1) return { headerIdx: -1, units: [] };
+  const units = [];
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
-    if ((row[0] ?? '').toString().trim() !== sku) continue;
-    const status = (row[5] ?? '').toString().trim();
-    const alreadyThisOrder = (row[7] ?? '').toString().trim() === orderId;
-    if (alreadyThisOrder || !status || status === 'Available — not yet allocated') {
-      const rowNumber = r + 1;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: process.env.SHEET_ID,
-        range: `'${tabName}'!D${rowNumber}:H${rowNumber}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [[customerName || '', contact || '', 'Needs to be sent', `Order ${orderId}`, orderId]] }
-      });
-      return { claimed: true, tabName, rowNumber, sku };
-    }
+    if (!(row[0] ?? '').toString().trim()) continue;
+    units.push({ index: r, row: UNIT_TAB_HEADERS.map((_, i) => (row[i] ?? '').toString()) });
   }
-  return { claimed: false, reason: `No available "${sku}" unit found in "${tabName}" — every tracked unit there is already claimed.` };
+  return { headerIdx, units };
 }
 
-// Finds whatever unit row (in any unit tab) currently carries this Order
-// ID and releases it — called before re-claiming under new details so an
-// edit actually MOVES the magnet instead of leaving a duplicate stale
-// claim on the old item. On a fixed-pool tab (Stock On Shore, Batch N -
-// On Water) this just blanks the row back to "Available — not yet
-// allocated", since the row itself represents a real physical unit that
-// still exists. On "Next Custom Order" (an open-ended queue, no fixed
-// rows) the row was created solely for this order, so it's deleted
-// outright rather than left behind as a meaningless blank placeholder.
-async function releaseUnitForOrder(orderId) {
-  const sheetsMeta = await getSheetMeta();
-  const candidateTabs = sheetsMeta
-    .map((s) => s.properties.title)
-    .filter((t) => t === 'Stock On Shore' || t === 'Next Custom Order' || /on water/i.test(t));
+function isFreeUnit(row) {
+  const status = (row[5] ?? '').trim();
+  return !(row[7] ?? '').trim() && (!status || status === AVAILABLE_STATUS);
+}
 
-  for (const tabName of candidateTabs) {
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: tabName });
-    const rows = res.data.values ?? [];
-    for (let r = 0; r < rows.length; r++) {
-      if ((rows[r][7] ?? '').toString().trim() === orderId) {
-        const rowNumber = r + 1;
-        if (tabName === 'Next Custom Order') {
-          const sheetId = await getSheetIdByTitle(tabName);
-          await sheets.spreadsheets.batchUpdate({
-            spreadsheetId: process.env.SHEET_ID,
-            requestBody: { requests: [{ deleteDimension: { range: { sheetId, dimension: 'ROWS', startIndex: r, endIndex: r + 1 } } }] }
-          });
-        } else {
-          await sheets.spreadsheets.values.update({
-            spreadsheetId: process.env.SHEET_ID,
-            range: `'${tabName}'!D${rowNumber}:H${rowNumber}`,
-            valueInputOption: 'RAW',
-            requestBody: { values: [['', '', 'Available — not yet allocated', '', '']] }
-          });
-        }
-        return { released: true, tabName, rowNumber };
-      }
-    }
+async function appendUnitRows(tabName, rows) {
+  if (!rows.length) return;
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${tabName}'!A:A`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: rows }
+  });
+}
+
+// Deletes rows bottom-up in one request so earlier deletions don't shift
+// the indexes of later ones.
+async function deleteUnitRows(tabName, indexes) {
+  if (!indexes.length) return;
+  const sheetId = await getSheetIdByTitle(tabName);
+  const requests = [...indexes].sort((a, b) => b - a).map((i) => ({
+    deleteDimension: { range: { sheetId, dimension: 'ROWS', startIndex: i, endIndex: i + 1 } }
+  }));
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.SHEET_ID, requestBody: { requests } });
+}
+
+async function resolveUnitTabName(allocation, batchReference) {
+  if (allocation === 'On Shore') return ON_SHORE_TAB;
+  if (allocation === 'Next Custom Order') return NEXT_CUSTOM_ORDER_TAB;
+  if (allocation === 'On Water' || allocation === 'In Production') {
+    const sheetsMeta = await getSheetMeta();
+    const found = findBatchTab(sheetsMeta, allocation === 'On Water' ? /on water/i : /in production/i, batchDigits(batchReference));
+    return found ? found.title : null;
   }
-  return { released: false };
+  return null;
+}
+
+function unitClaimFailure(allocation, batchReference) {
+  if (allocation === 'In Production') {
+    return { claimed: false, reason: `No "Batch ${batchDigits(batchReference) ?? '?'} - In Production" tab exists — start that production batch on the Stock page first.` };
+  }
+  return { claimed: false, reason: `Couldn't find a matching unit tab for allocation "${allocation}"${batchReference ? ` / batch "${batchReference}"` : ''}.` };
+}
+
+// Claims one row per unit ordered. On a fixed-pool tab (On Shore, a batch
+// In Production / On Water) that means filling free rows for this SKU; on
+// Next Custom Order (an open-ended queue) it means adding rows. A partial
+// claim (fewer free units than ordered) is kept and reported, not rolled
+// back — the shortfall is the real, useful signal.
+async function claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, contact) {
+  if (!tabName || !sku) return { claimed: false, reason: 'No matching unit tab or SKU to claim against.' };
+  const qty = Math.max(1, Number(quantity) || 1);
+  await ensureUnitTabHeader(tabName);
+
+  if (tabName === NEXT_CUSTOM_ORDER_TAB) {
+    const overview = await getStockOverview();
+    const product = overview.products.find((p) => p.sku === sku);
+    const row = [sku, product?.productName || '', product?.modelSize || '', customerName || '', contact || '', 'Needs to be sent', `Order ${orderId}`, orderId];
+    await appendUnitRows(tabName, Array.from({ length: qty }, () => [...row]));
+    return { claimed: true, tabName, sku, claimedCount: qty, requested: qty };
+  }
+
+  const { headerIdx, units } = await readUnitRows(tabName);
+  if (headerIdx === -1) return { claimed: false, reason: `"${tabName}" has no SKU header row.` };
+
+  const free = units.filter((u) => u.row[0].trim() === sku && isFreeUnit(u.row)).slice(0, qty);
+  if (free.length) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: {
+        valueInputOption: 'RAW',
+        data: free.map((u) => ({
+          range: `'${tabName}'!D${u.index + 1}:H${u.index + 1}`,
+          values: [[customerName || '', contact || '', 'Needs to be sent', `Order ${orderId}`, orderId]]
+        }))
+      }
+    });
+  }
+  const shortfall = qty - free.length;
+  return {
+    claimed: free.length > 0,
+    tabName, sku,
+    claimedCount: free.length,
+    requested: qty,
+    rowNumbers: free.map((u) => u.index + 1),
+    ...(shortfall > 0 ? { reason: `Only ${free.length} of ${qty} "${sku}" unit(s) free in "${tabName}" — ${shortfall} not linked to a unit.` } : {})
+  };
+}
+
+// Releases EVERY unit row carrying this Order ID, across all live unit
+// tabs — called before re-claiming under new details so an edit actually
+// MOVES the magnet instead of leaving stale claims behind. On a fixed-pool
+// tab the row is a real physical unit that still exists, so it's blanked
+// back to Available; on Next Custom Order the row existed only for this
+// order, so it's deleted.
+async function releaseUnitsForOrder(orderId) {
+  const sheetsMeta = await getSheetMeta();
+  const released = [];
+  for (const tabName of sheetsMeta.map((s) => s.properties.title).filter(isLiveUnitTab)) {
+    const { units } = await readUnitRows(tabName);
+    const mine = units.filter((u) => u.row[7].trim() === orderId);
+    if (!mine.length) continue;
+    if (tabName === NEXT_CUSTOM_ORDER_TAB) {
+      await deleteUnitRows(tabName, mine.map((u) => u.index));
+    } else {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: process.env.SHEET_ID,
+        requestBody: {
+          valueInputOption: 'RAW',
+          data: mine.map((u) => ({ range: `'${tabName}'!D${u.index + 1}:H${u.index + 1}`, values: [['', '', AVAILABLE_STATUS, '', '']] }))
+        }
+      });
+    }
+    released.push({ tabName, count: mine.length });
+  }
+  return { released: released.length > 0, tabs: released };
+}
+
+// Writes named columns on one Automation Log entry in place.
+async function setLogFields(headers, entry, fields) {
+  const data = Object.entries(fields).map(([header, value]) => {
+    const idx = headers.indexOf(header);
+    return { range: `'${AUTOMATION_LOG_TAB}'!${columnIndexToLetter(idx)}${entry.rowNumber}`, values: [[value]] };
+  });
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: process.env.SHEET_ID,
+    requestBody: { valueInputOption: 'USER_ENTERED', data }
+  });
+}
+
+// STAGE 1 → 2: an order has been placed with the manufacturer. Creates (or
+// adds to) "Batch N - In Production" with one row per unit ordered, and
+// moves waiting Next Custom Order customers onto those rows first (oldest
+// first, matched by SKU). Remaining rows are free units anyone can be
+// assigned to later. Rows are written to the new tab BEFORE being deleted
+// from Next Custom Order, so a failure part-way leaves a duplicate to tidy,
+// never a lost customer.
+async function startProductionBatch({ batchReference, items }) {
+  const digits = batchDigits(batchReference);
+  if (!digits) throw new Error('batchReference must contain a batch number, e.g. "Batch 13".');
+  const lines = (items || []).map((i) => ({ sku: (i.sku || '').trim(), quantity: Number(i.quantity) }));
+  if (!lines.length || lines.some((l) => !l.sku || !Number.isInteger(l.quantity) || l.quantity < 1)) {
+    throw new Error('items must be a list of { sku, quantity } with whole-number quantities of 1 or more.');
+  }
+
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const sheetsMeta = await getSheetMeta();
+    if (findBatchTab(sheetsMeta, /on water/i, digits)) {
+      throw new Error(`Batch ${digits} is already on the water — it can't take new production units.`);
+    }
+    const tabName = findBatchTab(sheetsMeta, /in production/i, digits)?.title || `Batch ${digits} - In Production`;
+    await ensureUnitTab(tabName);
+
+    const overview = await getStockOverview();
+    const { units: waiting } = await readUnitRows(NEXT_CUSTOM_ORDER_TAB);
+    const taken = new Set();
+    const newRows = [];
+    const movedIndexes = [];
+    const movedOrders = new Set();
+    const summary = [];
+
+    for (const { sku, quantity } of lines) {
+      const product = overview.products.find((p) => p.sku === sku);
+      // A waiting customer is any row with an Order ID (logged via the
+      // console) or a name typed straight into the sheet.
+      const queue = waiting.filter((u) => u.row[0].trim() === sku && (u.row[7].trim() || u.row[3].trim()) && !taken.has(u.index));
+      let assigned = 0;
+      for (let i = 0; i < quantity; i++) {
+        const u = queue[i];
+        if (u) {
+          taken.add(u.index);
+          movedIndexes.push(u.index);
+          if (u.row[7].trim()) movedOrders.add(u.row[7].trim());
+          newRows.push([sku, u.row[1] || product?.productName || '', u.row[2] || product?.modelSize || '', u.row[3], u.row[4], u.row[5] || 'Needs to be sent', u.row[6], u.row[7]]);
+          assigned++;
+        } else {
+          newRows.push([sku, product?.productName || '', product?.modelSize || '', '', '', AVAILABLE_STATUS, '', '']);
+        }
+      }
+      summary.push({ sku, units: quantity, assignedFromCustomOrders: assigned, free: quantity - assigned, stillWaitingInNextCustomOrder: Math.max(0, queue.length - quantity) });
+    }
+
+    await appendUnitRows(tabName, newRows);
+    await deleteUnitRows(NEXT_CUSTOM_ORDER_TAB, movedIndexes);
+
+    // An order only flips to In Production in the log once ALL of its units
+    // have moved — if some are still waiting (manufacturer order smaller
+    // than demand), it stays Next Custom Order and is reported as split.
+    const stillWaitingByOrder = {};
+    for (const u of waiting) {
+      if (taken.has(u.index)) continue;
+      const id = u.row[7].trim();
+      if (id) stillWaitingByOrder[id] = (stillWaitingByOrder[id] || 0) + 1;
+    }
+    const log = await getAutomationLogRows();
+    const splitOrders = [];
+    for (const orderId of movedOrders) {
+      const entry = log.entries.find((e) => e['Order ID'] === orderId);
+      if (!entry) continue;
+      if (stillWaitingByOrder[orderId]) { splitOrders.push(orderId); continue; }
+      await setLogFields(log.headers, entry, { 'Allocation': 'In Production', 'Batch Reference': `Batch ${digits}`, 'Order Placed': 'TRUE' });
+    }
+
+    return { tabName, summary, ordersMovedToProduction: [...movedOrders].filter((id) => !splitOrders.includes(id)), splitOrders };
+  });
+}
+
+// STAGE 2 → 3: the batch has left the factory. Renaming the tab keeps every
+// row — and every customer on it — exactly where it is.
+async function markBatchShipped(batchReference) {
+  const digits = batchDigits(batchReference);
+  if (!digits) throw new Error('batchReference must contain a batch number, e.g. "Batch 13".');
+
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const sheetsMeta = await getSheetMeta();
+    const prodTab = findBatchTab(sheetsMeta, /in production/i, digits);
+    if (!prodTab) throw new Error(`No "Batch ${digits} - In Production" tab found.`);
+    if (findBatchTab(sheetsMeta, /on water/i, digits)) throw new Error(`A Batch ${digits} On Water tab already exists — resolve that in the sheet first.`);
+
+    const newTitle = prodTab.title.replace(/in production/i, 'On Water');
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.SHEET_ID,
+      requestBody: { requests: [{ updateSheetProperties: { properties: { sheetId: prodTab.sheetId, title: newTitle }, fields: 'title' } }] }
+    });
+
+    const log = await getAutomationLogRows();
+    const matching = log.entries.filter((e) => e['Allocation'] === 'In Production' && batchDigits(e['Batch Reference']) === digits);
+    for (const entry of matching) await setLogFields(log.headers, entry, { 'Allocation': 'On Water' });
+
+    return { batchReference, tabName: newTitle, flippedCount: matching.length, flipped: matching.map((e) => e['Order ID']) };
+  });
+}
+
+// Moves every unit row carrying this Order ID (from any live unit tab) into
+// the Shipped tab. Called by markOrderSent.
+async function moveOrderUnitsToShipped(orderId, { courier, trackingNumber, sentDate }) {
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const sheetsMeta = await getSheetMeta();
+    const found = [];
+    for (const tabName of sheetsMeta.map((s) => s.properties.title).filter(isLiveUnitTab)) {
+      const { units } = await readUnitRows(tabName);
+      const mine = units.filter((u) => u.row[7].trim() === orderId);
+      if (mine.length) found.push({ tabName, mine });
+    }
+    if (!found.length) return { moved: 0 };
+
+    await ensureUnitTab(SHIPPED_TAB);
+    const shippedNote = [`Shipped ${sentDate}`, courier, trackingNumber && `tracking ${trackingNumber}`].filter(Boolean).join(' · ');
+    const rows = found.flatMap(({ mine }) => mine.map((u) => {
+      const row = [...u.row];
+      row[5] = 'Shipped';
+      row[6] = [row[6], shippedNote].filter(Boolean).join(' — ');
+      return row;
+    }));
+    await appendUnitRows(SHIPPED_TAB, rows);
+    for (const { tabName, mine } of found) await deleteUnitRows(tabName, mine.map((u) => u.index));
+    return { moved: rows.length, from: found.map((f) => f.tabName) };
+  });
 }
 
 async function logSoldDeal({ source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
@@ -708,12 +937,12 @@ async function logSoldDeal({ source, externalRef, customerName, email, sku, quan
 
   let unitClaim = { claimed: false, reason: 'No allocation set — nothing to claim yet.' };
   if (sku && allocation) {
-    const tabName = await resolveUnitTabName(allocation, batchReference);
-    unitClaim = tabName
-      ? await claimUnitForOrder(tabName, sku, orderId, customerName, email)
-      : { claimed: false, reason: allocation === 'In Production'
-          ? 'In Production has no per-unit tab yet — nothing to claim.'
-          : `Couldn't find a matching unit tab for allocation "${allocation}"${batchReference ? ` / batch "${batchReference}"` : ''}.` };
+    unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
+      const tabName = await resolveUnitTabName(allocation, batchReference);
+      return tabName
+        ? claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, email)
+        : unitClaimFailure(allocation, batchReference);
+    });
   }
 
   return { orderId, stockCheck: stockCheckNote, unitClaim };
@@ -804,20 +1033,17 @@ async function editDealDetails(orderId, fields) {
   // Re-magnet — anything that changes WHICH unit this order should be
   // stuck to (or who it's for) releases the old claimed row and claims the
   // correct one fresh, rather than leaving a stale claim on the old item.
-  const relinkTriggers = ['sku', 'allocation', 'batchReference', 'customerName', 'email'];
+  const relinkTriggers = ['sku', 'quantity', 'allocation', 'batchReference', 'customerName', 'email'];
   let unitClaim;
   if (relinkTriggers.some((k) => changedKeys.includes(k))) {
-    await releaseUnitForOrder(orderId);
-    if (updated['SKU'] && updated['Allocation']) {
+    unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
+      await releaseUnitsForOrder(orderId);
+      if (!updated['SKU'] || !updated['Allocation']) return { claimed: false, reason: 'No SKU/allocation set — nothing to claim.' };
       const tabName = await resolveUnitTabName(updated['Allocation'], updated['Batch Reference']);
-      unitClaim = tabName
-        ? await claimUnitForOrder(tabName, updated['SKU'], orderId, updated['Customer Name'], updated['Email'])
-        : { claimed: false, reason: updated['Allocation'] === 'In Production'
-            ? 'In Production has no per-unit tab yet — nothing to claim.'
-            : `Couldn't find a matching unit tab for allocation "${updated['Allocation']}"${updated['Batch Reference'] ? ` / batch "${updated['Batch Reference']}"` : ''}.` };
-    } else {
-      unitClaim = { claimed: false, reason: 'No SKU/allocation set — nothing to claim.' };
-    }
+      return tabName
+        ? claimUnitsForOrder(tabName, updated['SKU'], updated['Quantity'], orderId, updated['Customer Name'], updated['Email'])
+        : unitClaimFailure(updated['Allocation'], updated['Batch Reference']);
+    });
   }
 
   return { orderId, updated: changedKeys, unitClaim };
@@ -850,14 +1076,16 @@ async function markOrderSent({ orderId, courier, trackingNumber, sentDate }) {
   const courierCol = columnIndexToLetter(headers.indexOf('Courier'));
   const sentDateCol = columnIndexToLetter(headers.indexOf('Order Sent Date'));
 
+  const date = sentDate || new Date().toISOString().slice(0, 10);
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
     range: `'${AUTOMATION_LOG_TAB}'!${courierCol}${entry.rowNumber}:${sentDateCol}${entry.rowNumber}`,
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[courier || '', trackingNumber || '', sentDate || new Date().toISOString().slice(0, 10)]] }
+    requestBody: { values: [[courier || '', trackingNumber || '', date]] }
   });
 
-  return { orderId, courier, trackingNumber, sentDate };
+  const units = await moveOrderUnitsToShipped(orderId, { courier, trackingNumber, sentDate: date });
+  return { orderId, courier, trackingNumber, sentDate: date, unitsMovedToShipped: units.moved };
 }
 
 // Finds an entry (and its row) by either key — orderId (what the ops
@@ -951,25 +1179,49 @@ function deriveOrderStatus(entry) {
 // confirmed process for the column rollover — guessing either risks the
 // live stock formulas. Stays a manual step in Stock Overview for now.
 // ---------------------------------------------------------------------------
+//
+// EXTENDED 2026-09-28 (STAGE 3 → 4): also moves every unit row on "Batch N -
+// On Water" — allocated and free — into Stock On Shore, customers attached,
+// then deletes the emptied batch tab. Rows are copied before the tab is
+// deleted, so a failure part-way leaves duplicates, never lost units.
+// Matched by batch number now, not exact text, so "batch 12" and "Batch 12"
+// are the same batch.
 async function markBatchArrived(batchReference) {
-  const { headers, entries } = await getAutomationLogRows();
-  const allocationCol = columnIndexToLetter(headers.indexOf('Allocation'));
-  const matching = entries.filter((e) => e['Allocation'] === 'On Water' && e['Batch Reference'] === batchReference);
+  const digits = batchDigits(batchReference);
+  return withLock(UNIT_TABS_LOCK, async () => {
+    let unitsMoved = 0;
+    let tabRemoved = null;
+    const waterTab = findBatchTab(await getSheetMeta(), /on water/i, digits);
+    if (waterTab) {
+      const { units } = await readUnitRows(waterTab.title);
+      await ensureUnitTabHeader(ON_SHORE_TAB);
+      await appendUnitRows(ON_SHORE_TAB, units.map((u) => u.row));
+      unitsMoved = units.length;
+      // Keep Stock On Shore grouped by SKU so it reads as a report.
+      const shoreSheetId = await getSheetIdByTitle(ON_SHORE_TAB);
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: process.env.SHEET_ID,
+        requestBody: { requests: [
+          { sortRange: { range: { sheetId: shoreSheetId, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: UNIT_TAB_HEADERS.length }, sortSpecs: [{ dimensionIndex: 0, sortOrder: 'ASCENDING' }] } },
+          { deleteSheet: { sheetId: waterTab.sheetId } }
+        ] }
+      });
+      tabRemoved = waterTab.title;
+    }
 
-  for (const entry of matching) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `'${AUTOMATION_LOG_TAB}'!${allocationCol}${entry.rowNumber}`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [['On Shore']] }
-    });
-  }
+    const { headers, entries } = await getAutomationLogRows();
+    const matching = entries.filter((e) => e['Allocation'] === 'On Water' &&
+      (digits ? batchDigits(e['Batch Reference']) === digits : e['Batch Reference'] === batchReference));
+    for (const entry of matching) await setLogFields(headers, entry, { 'Allocation': 'On Shore' });
 
-  return {
-    batchReference,
-    flippedCount: matching.length,
-    flipped: matching.map((e) => ({ orderId: e['Order ID'], customerName: e['Customer Name'], sku: e['SKU'], quantity: e['Quantity'] }))
-  };
+    return {
+      batchReference,
+      unitsMoved,
+      tabRemoved,
+      flippedCount: matching.length,
+      flipped: matching.map((e) => ({ orderId: e['Order ID'], customerName: e['Customer Name'], sku: e['SKU'], quantity: e['Quantity'] }))
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1547,26 @@ app.post('/admin/mark-batch-arrived', async (req, res) => {
     res.json({ ok: true, ...(await markBatchArrived(batchReference)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Stage moves for per-unit tracking — see the EVERY UNIT, EVERY STAGE block.
+app.post('/admin/start-production-batch', async (req, res) => {
+  const { batchReference, items } = req.body;
+  try {
+    res.json({ ok: true, ...(await startProductionBatch({ batchReference, items })) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/admin/mark-batch-shipped', async (req, res) => {
+  const { batchReference } = req.body;
+  if (!batchReference) return res.status(400).json({ error: 'batchReference is required' });
+  try {
+    res.json({ ok: true, ...(await markBatchShipped(batchReference)) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

@@ -16,6 +16,24 @@ old sheet's layout (BATCH 9–12 tabs, etc.) and may describe tabs that no
 longer exist in the live one. If `SHEET_ID` changes in Railway, update this
 section and `env-vars.txt` in the same step.
 
+## Every unit, every stage (2026-09-28)
+One row per physical unit in every stage tab, so each tab is a report of
+what's in that location, allocated or free. A customer's row (Order ID in
+column H) follows the unit through each stage:
+
+| Stage | Tab | How units get there |
+|---|---|---|
+| Sold, not yet ordered | `Next Custom Order` | Log Sale with allocation "Next Custom Order" (one row per unit) |
+| Being manufactured | `Batch N - In Production` | `POST /admin/start-production-batch` `{batchReference, items:[{sku, quantity}]}` creates the rows and moves waiting custom-order customers onto them |
+| Shipped from factory | `Batch N - On Water` | `POST /admin/mark-batch-shipped` `{batchReference}` renames the tab |
+| In the warehouse | `Stock On Shore` | `POST /admin/mark-batch-arrived` moves every row in and deletes the emptied batch tab. "Needs to be sent" = ready to book for dispatch |
+| Sent | `Shipped` | `POST /admin/mark-order-sent` moves the order's rows in |
+
+Logging or editing a deal claims one row per unit of its quantity (a
+partial claim is kept and the shortfall reported). All unit-tab changes run
+under one lock. Stock Overview's aggregate counters are NOT updated by any
+of this; they're still maintained by hand.
+
 **2026-08-31 — audit fixes**: `recordNewOrderAgainstBatch` is now locked
 per-SKU (was a non-atomic read-modify-write that could silently lose an
 increment under concurrent calls), `/admin/set-final-payment-status`
