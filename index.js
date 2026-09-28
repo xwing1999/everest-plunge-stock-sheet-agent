@@ -880,6 +880,55 @@ async function moveOrderUnitsToShipped(orderId, { courier, trackingNumber, sentD
   });
 }
 
+// UNIT STOCK VIEW (2026-09-28) — Xavier: the Stock page should flick
+// between Stock On Shore / each batch / Next Custom Order and show, per
+// product, how many are allocated vs available — read straight from the
+// unit rows, so anything typed directly into the sheet (not just deals
+// logged through the console) shows up. A unit counts as allocated if it
+// has a name, an Order ID, or any status other than blank/Available.
+function unitIsAllocated(row) {
+  const status = (row[5] ?? '').trim();
+  return Boolean(row[3].trim() || row[7].trim() || (status && !/^available/i.test(status)));
+}
+
+function unitTabOrder(title) {
+  if (title === ON_SHORE_TAB) return [0, 0];
+  if (title === NEXT_CUSTOM_ORDER_TAB) return [3, 0];
+  const n = Number(batchDigits(title) || 0);
+  return [/on water/i.test(title) ? 1 : 2, n];
+}
+
+async function getUnitStock() {
+  const sheetsMeta = await getSheetMeta();
+  const titles = sheetsMeta.map((s) => s.properties.title).filter(isLiveUnitTab)
+    .sort((a, b) => { const x = unitTabOrder(a), y = unitTabOrder(b); return x[0] - y[0] || x[1] - y[1]; });
+
+  const tabs = [];
+  for (const tabName of titles) {
+    const { units } = await readUnitRows(tabName);
+    const real = units.filter((u) => !/^\(example\)$/i.test(u.row[0].trim()));
+    const bySku = new Map();
+    for (const { row } of real) {
+      const sku = row[0].trim();
+      if (!bySku.has(sku)) bySku.set(sku, { sku, product: row[1], modelSize: row[2], total: 0, allocated: 0, available: 0 });
+      const p = bySku.get(sku);
+      p.total++;
+      if (unitIsAllocated(row)) p.allocated++; else p.available++;
+    }
+    tabs.push({
+      tabName,
+      stage: tabName === ON_SHORE_TAB ? 'On Shore' : tabName === NEXT_CUSTOM_ORDER_TAB ? 'Next Custom Order' : /on water/i.test(tabName) ? 'On Water' : 'In Production',
+      batch: batchDigits(tabName) ? `Batch ${batchDigits(tabName)}` : null,
+      products: [...bySku.values()].sort((a, b) => a.sku.localeCompare(b.sku)),
+      units: real.map(({ row }) => ({
+        sku: row[0].trim(), product: row[1], modelSize: row[2], allocatedTo: row[3], contact: row[4],
+        status: row[5], notes: row[6], orderId: row[7], allocated: unitIsAllocated(row)
+      }))
+    });
+  }
+  return { tabs };
+}
+
 async function logSoldDeal({ source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
   await ensureAutomationLogTab();
 
@@ -1372,7 +1421,13 @@ app.get('/admin/batch/:name', async (req, res) => {
 
 app.get('/admin/delivered-orders', async (_req, res) => {
   try {
-    const entries = await getLedgerTab(process.env.DELIVERED_ORDERS_TAB || 'DELIVERED FIRST ORDERS');
+    // The live sheet (switched 2026-09-25) has no historical Delivered tab —
+    // that lives in the archived old sheet. Empty, not an error.
+    const tabName = process.env.DELIVERED_ORDERS_TAB || 'DELIVERED FIRST ORDERS';
+    if (!(await getSheetMeta()).some((s) => s.properties.title === tabName)) {
+      return res.json({ clientCount: 0, entries: [], note: `No "${tabName}" tab in the live sheet — historical deliveries are in the archived old spreadsheet.` });
+    }
+    const entries = await getLedgerTab(tabName);
     res.json({ clientCount: entries.length, entries });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1545,6 +1600,14 @@ app.post('/admin/mark-batch-arrived', async (req, res) => {
   if (!batchReference) return res.status(400).json({ error: 'batchReference is required' });
   try {
     res.json({ ok: true, ...(await markBatchArrived(batchReference)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/unit-stock', async (_req, res) => {
+  try {
+    res.json(await getUnitStock());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
