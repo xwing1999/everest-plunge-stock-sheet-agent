@@ -1147,7 +1147,7 @@ async function renameBatch({ tabName, newBatchReference }) {
 // was a category label, not a product): its Stock Overview row, every unit
 // row with that SKU (including Shipped), and the Product name on its deals.
 // Written RAW so a size like "- EP1 Chiller" isn't parsed as a formula.
-async function renameProduct({ sku, productName, modelSize }) {
+async function renameProduct({ sku, productName, modelSize, retailPrice }) {
   if (!sku || !productName) throw new Error('sku and productName are required.');
   return withLock(UNIT_TABS_LOCK, async () => {
     const changed = { overview: 0, units: 0, deals: 0 };
@@ -1162,6 +1162,8 @@ async function renameProduct({ sku, productName, modelSize }) {
         if ((rows[r][0] ?? '').toString().trim() !== sku) continue;
         const data = [{ range: `'${stockOverviewTab}'!${columnIndexToLetter(nameCol)}${r + 1}`, values: [[productName]] }];
         if (modelSize !== undefined && sizeCol !== -1) data.push({ range: `'${stockOverviewTab}'!${columnIndexToLetter(sizeCol)}${r + 1}`, values: [[modelSize]] });
+        const priceCol = headers.findIndex((x) => x.startsWith('RETAIL'));
+        if (retailPrice != null && retailPrice !== '' && priceCol !== -1) data.push({ range: `'${stockOverviewTab}'!${columnIndexToLetter(priceCol)}${r + 1}`, values: [[Number(retailPrice)]] });
         await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: process.env.SHEET_ID, requestBody: { valueInputOption: 'RAW', data } });
         changed.overview++;
       }
