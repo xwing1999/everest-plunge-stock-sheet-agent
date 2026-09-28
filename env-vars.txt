@@ -40,6 +40,7 @@ SHEET_ID=1LBwPSjiJ-ijO9teLwXbtFirWDcDNWLmd0DKadKSGFnI
 # Confirmed real tab name (as of the 2026-08-13 export) — includes the
 # emoji, same convention as the batch tabs. Change only if you've actually
 # renamed the tab in the live sheet.
+# Matched by prefix (2026-09-28) — the live tab is "📦 Stock Overview_13.08.2026".
 STOCK_OVERVIEW_TAB=📦 Stock Overview
 
 # Tab this agent creates and owns itself for the "log sold deal / mark

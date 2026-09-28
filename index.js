@@ -199,16 +199,31 @@ async function insertClientRow(tabName, rowValues) {
 // landed batch, since both use the same "first Batch N column" logic.
 // ---------------------------------------------------------------------------
 const STOCK_OVERVIEW_TAB = process.env.STOCK_OVERVIEW_TAB || '📦 Stock Overview';
+// Resolved against the live tab list on each use: an exact match on
+// STOCK_OVERVIEW_TAB, else the first tab whose name starts with it — the
+// live tab is "📦 Stock Overview_13.08.2026", so a date suffix or a reset
+// env var mustn't break every stock screen (audit 2026-09-28).
+let stockOverviewTab = STOCK_OVERVIEW_TAB;
+async function refreshStockOverviewTab() {
+  const titles = (await getSheetMeta()).map((s) => s.properties.title);
+  const found = titles.find((t) => t === STOCK_OVERVIEW_TAB)
+    || titles.find((t) => t.startsWith(STOCK_OVERVIEW_TAB))
+    || titles.find((t) => /stock overview/i.test(t));
+  if (!found) throw new Error(`No Stock Overview tab found (looked for "${STOCK_OVERVIEW_TAB}").`);
+  stockOverviewTab = found;
+  return found;
+}
 
 async function getStockOverview() {
+  await refreshStockOverviewTab();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
-    range: STOCK_OVERVIEW_TAB
+    range: stockOverviewTab
   });
   const rows = res.data.values ?? [];
 
   const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
-  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${STOCK_OVERVIEW_TAB}".`);
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${stockOverviewTab}".`);
   const headers = rows[headerRowIdx].map((h) => (h ?? '').toString().trim());
 
   const singleCol = {
@@ -222,7 +237,7 @@ async function getStockOverview() {
     balance: headers.findIndex((h) => h.toUpperCase() === 'BALANCE')
   };
   const missing = Object.entries(singleCol).filter(([, idx]) => idx === -1).map(([name]) => name);
-  if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}. Sheet structure may have changed — check "${STOCK_OVERVIEW_TAB}" by eye before trusting this.`);
+  if (missing.length) throw new Error(`Stock Overview header row is missing expected column(s): ${missing.join(', ')}. Sheet structure may have changed — check "${stockOverviewTab}" by eye before trusting this.`);
 
   // First "Batch N" column in header order = the landed/current batch,
   // paired with In Stock/Available/Balance. Any later "Batch N" columns =
@@ -357,7 +372,7 @@ async function recordNewOrderAgainstBatchLocked(sku, quantity) {
   const newValue = product.newOrders + quantity;
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
-    range: `'${STOCK_OVERVIEW_TAB}'!${newOrdersColLetter}${product.rowNumber}`,
+    range: `'${stockOverviewTab}'!${newOrdersColLetter}${product.rowNumber}`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [[newValue]] }
   });
@@ -984,14 +999,23 @@ async function logSoldDeal({ source, externalRef, customerName, email, sku, quan
     requestBody: { values: [row] }
   });
 
-  let unitClaim = { claimed: false, reason: 'No allocation set — nothing to claim yet.' };
+  // The deal row is already written above, so nothing after this point may
+  // throw — a thrown error here would show "Failed" for a deal that WAS
+  // logged, and a retry would create a duplicate (audit 2026-09-28).
+  let unitClaim = !allocation
+    ? { claimed: false, reason: 'No allocation set — nothing to claim yet.' }
+    : { claimed: false, reason: 'No product (SKU) set — nothing to claim yet.' };
   if (sku && allocation) {
-    unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
-      const tabName = await resolveUnitTabName(allocation, batchReference);
-      return tabName
-        ? claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, email)
-        : unitClaimFailure(allocation, batchReference);
-    });
+    try {
+      unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
+        const tabName = await resolveUnitTabName(allocation, batchReference);
+        return tabName
+          ? claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, email)
+          : unitClaimFailure(allocation, batchReference);
+      });
+    } catch (err) {
+      unitClaim = { claimed: false, reason: `Deal logged, but linking it to a unit failed: ${err.message}. Use Edit on the deal to retry — don't log it again.` };
+    }
   }
 
   return { orderId, stockCheck: stockCheckNote, unitClaim };
@@ -1044,9 +1068,14 @@ async function editDealDetails(orderId, fields) {
     if (value === undefined) continue;
     const header = EDITABLE_DEAL_FIELDS[key];
     if (!header) throw new Error(`"${key}" is not an editable field.`);
+    // Only real changes count — the Edit dialog sends every field, and
+    // treating an unchanged one as changed re-linked the unit on every
+    // save (audit 2026-09-28).
+    if (String(value ?? '').trim() === String(entry[header] ?? '').trim()) continue;
     updated[header] = value;
     changedKeys.push(key);
   }
+  if (!changedKeys.length) return { orderId, updated: [], unitClaim: undefined };
 
   // SKU or Quantity changed — re-derive Product name and Stock Check so
   // they don't go stale and silently disagree with the corrected line.
@@ -1084,7 +1113,11 @@ async function editDealDetails(orderId, fields) {
   // correct one fresh, rather than leaving a stale claim on the old item.
   const relinkTriggers = ['sku', 'quantity', 'allocation', 'batchReference', 'customerName', 'email'];
   let unitClaim;
-  if (relinkTriggers.some((k) => changedKeys.includes(k))) {
+  if (relinkTriggers.some((k) => changedKeys.includes(k)) && entry['Order Sent Date']) {
+    // Already shipped — its unit is in the Shipped tab and must not be
+    // swapped for a fresh warehouse unit.
+    unitClaim = { claimed: false, reason: 'Order already sent — details saved, unit link left unchanged.' };
+  } else if (relinkTriggers.some((k) => changedKeys.includes(k))) {
     unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
       await releaseUnitsForOrder(orderId);
       if (!updated['SKU'] || !updated['Allocation']) return { claimed: false, reason: 'No SKU/allocation set — nothing to claim.' };
@@ -1196,6 +1229,17 @@ function saveBatchEtas(map) {
   } catch (err) {
     console.warn('Could not persist batch ETAs to disk:', err.message);
   }
+}
+
+// ETAs are typed free-text ("Batch 12", "batch12"); match by batch number
+// so the Deals page and the final-invoice sweep see the same ETA the Stock
+// page does (audit 2026-09-28).
+function findBatchEta(map, batchReference) {
+  if (!batchReference) return null;
+  if (map[batchReference]) return map[batchReference];
+  const digits = batchDigits(batchReference);
+  const key = digits && Object.keys(map).find((k) => batchDigits(k) === digits);
+  return key ? map[key] : null;
 }
 
 function setBatchEta(batchReference, date) {
@@ -1492,7 +1536,7 @@ app.get('/admin/automation-log', async (_req, res) => {
         // order to its shipment. Consumers (ops console, pipely-xero-
         // agent's final-invoice sweep) read this one field rather than
         // each re-implementing the lookup.
-        'Ship ETA': batchEtas[e['Batch Reference']]?.eta ?? null
+        'Ship ETA': findBatchEta(batchEtas, e['Batch Reference'])?.eta ?? null
       }))
     });
   } catch (err) {
@@ -1667,13 +1711,14 @@ app.post('/admin/mark-order-placed', async (req, res) => {
 // duplicating or clobbering real inventory data.
 // ---------------------------------------------------------------------------
 async function addStockProduct({ sku, productName, modelSize, inStock }) {
+  await refreshStockOverviewTab();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
-    range: STOCK_OVERVIEW_TAB
+    range: stockOverviewTab
   });
   const rows = res.data.values ?? [];
   const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
-  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${STOCK_OVERVIEW_TAB}".`);
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row (a cell reading "SKU") in "${stockOverviewTab}".`);
   const headers = rows[headerRowIdx].map((h) => (h ?? '').toString().trim());
 
   const idx = {
@@ -1709,7 +1754,7 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
     if (!rowSku || rowSku.toUpperCase() === 'TOTALS') { insertBeforeIdx = r; break; }
   }
 
-  const sheetId = await getSheetIdByTitle(STOCK_OVERVIEW_TAB);
+  const sheetId = await getSheetIdByTitle(stockOverviewTab);
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: process.env.SHEET_ID,
     requestBody: {
@@ -1728,7 +1773,7 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
   // Product metadata should never be formula-interpreted.
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
-    range: `'${STOCK_OVERVIEW_TAB}'!A${rowNumber}`,
+    range: `'${stockOverviewTab}'!A${rowNumber}`,
     valueInputOption: 'RAW',
     requestBody: { values: [newRow] }
   });
@@ -1745,13 +1790,14 @@ async function addStockProduct({ sku, productName, modelSize, inStock }) {
 // Warehouse, Notes) is left exactly as-is. Refuses to overwrite a row
 // that already has a SKU, same duplicate-safety as addStockProduct.
 async function assignStockSku({ rowNumber, sku }) {
+  await refreshStockOverviewTab();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
-    range: STOCK_OVERVIEW_TAB
+    range: stockOverviewTab
   });
   const rows = res.data.values ?? [];
   const headerRowIdx = rows.findIndex((row) => (row[0] ?? '').toString().trim().toUpperCase() === 'SKU');
-  if (headerRowIdx === -1) throw new Error(`Could not find the header row in "${STOCK_OVERVIEW_TAB}".`);
+  if (headerRowIdx === -1) throw new Error(`Could not find the header row in "${stockOverviewTab}".`);
   const rowIdx = rowNumber - 1;
   if (rowIdx <= headerRowIdx || rowIdx >= rows.length) throw new Error(`Row ${rowNumber} is out of range for a product row.`);
   const currentSku = (rows[rowIdx][0] ?? '').toString().trim();
@@ -1761,7 +1807,7 @@ async function assignStockSku({ rowNumber, sku }) {
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.SHEET_ID,
-    range: `'${STOCK_OVERVIEW_TAB}'!A${rowNumber}`,
+    range: `'${stockOverviewTab}'!A${rowNumber}`,
     valueInputOption: 'RAW',
     requestBody: { values: [[sku]] }
   });
