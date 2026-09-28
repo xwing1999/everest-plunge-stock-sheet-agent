@@ -992,13 +992,136 @@ async function getUnitStock() {
       stage: tabName === ON_SHORE_TAB ? 'On Shore' : tabName === NEXT_CUSTOM_ORDER_TAB ? 'Next Custom Order' : /on water/i.test(tabName) ? 'On Water' : 'In Production',
       batch: batchDigits(tabName) ? `Batch ${batchDigits(tabName)}` : null,
       products: [...bySku.values()].sort((a, b) => a.sku.localeCompare(b.sku)),
-      units: real.map(({ row }) => ({
+      units: real.map(({ row, index }) => ({
+        rowNumber: index + 1,
         sku: row[0].trim(), product: row[1], modelSize: row[2], allocatedTo: row[3], contact: row[4],
         status: row[5], notes: row[6], orderId: row[7], allocated: unitIsAllocated(row)
       }))
     });
   }
   return { tabs };
+}
+
+// ---------------------------------------------------------------------------
+// MANUAL STOCK / UNIT EDITING (2026-09-28) — Xavier: "edit the numbers of
+// stock in each location and unmagnetise / edit clients stuck to stock."
+// Every edit names the exact row it expects (rowNumber + SKU + the Order ID
+// currently on it) and is refused if the row no longer matches — rows shift
+// when others are added/removed, and a stale click must never overwrite a
+// different customer's unit. All under the shared unit-tab lock.
+// ---------------------------------------------------------------------------
+async function loadExpectedUnit(tabName, rowNumber, expect = {}) {
+  if (!isLiveUnitTab(tabName) && tabName !== SHIPPED_TAB) throw new Error(`"${tabName}" isn't a stock location tab.`);
+  const { units } = await readUnitRows(tabName);
+  const u = units.find((x) => x.index + 1 === Number(rowNumber));
+  if (!u) throw new Error(`Row ${rowNumber} in "${tabName}" no longer exists — refresh and try again.`);
+  if (expect.sku && u.row[0].trim() !== expect.sku) throw new Error(`Row ${rowNumber} in "${tabName}" has changed (now ${u.row[0]}) — refresh and try again.`);
+  if (expect.orderId !== undefined && u.row[7].trim() !== (expect.orderId || '')) throw new Error(`Row ${rowNumber} in "${tabName}" is now linked to a different order — refresh and try again.`);
+  return u;
+}
+
+// Add N free units of a SKU to a location (e.g. correcting a count).
+async function addUnits({ tabName, sku, quantity }) {
+  const qty = Number(quantity);
+  if (!sku || !Number.isInteger(qty) || qty < 1 || qty > 100) throw new Error('sku and a whole-number quantity (1–100) are required.');
+  return withLock(UNIT_TABS_LOCK, async () => {
+    if (!isLiveUnitTab(tabName)) throw new Error(`"${tabName}" isn't a stock location tab.`);
+    await ensureUnitTabHeader(tabName);
+    const overview = await getStockOverview().catch(() => ({ products: [] }));
+    const known = overview.products.find((p) => p.sku === sku);
+    let productName = known?.productName || '', modelSize = known?.modelSize || '';
+    if (!known) {
+      const stock = await getUnitStock();
+      const any = stock.tabs.flatMap((t) => t.units).find((x) => x.sku === sku);
+      productName = any?.product || ''; modelSize = any?.modelSize || '';
+    }
+    const status = tabName === NEXT_CUSTOM_ORDER_TAB ? '' : AVAILABLE_STATUS;
+    await appendUnitRows(tabName, Array.from({ length: qty }, () => [sku, productName, modelSize, '', '', status, '', '']));
+    if (tabName === ON_SHORE_TAB) {
+      const sheetId = await getSheetIdByTitle(tabName);
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.SHEET_ID, requestBody: { requests: [{ sortRange: { range: { sheetId, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: UNIT_TAB_HEADERS.length }, sortSpecs: [{ dimensionIndex: 0, sortOrder: 'ASCENDING' }] } }] } });
+    }
+    return { tabName, sku, added: qty };
+  });
+}
+
+// Remove N FREE units of a SKU from a location. Never removes an assigned unit.
+async function removeUnits({ tabName, sku, quantity }) {
+  const qty = Number(quantity);
+  if (!sku || !Number.isInteger(qty) || qty < 1) throw new Error('sku and a whole-number quantity are required.');
+  return withLock(UNIT_TABS_LOCK, async () => {
+    if (!isLiveUnitTab(tabName)) throw new Error(`"${tabName}" isn't a stock location tab.`);
+    const { units } = await readUnitRows(tabName);
+    const free = units.filter((u) => u.row[0].trim() === sku && !unitIsAllocated(u.row));
+    if (free.length < qty) throw new Error(`Only ${free.length} free "${sku}" unit(s) in "${tabName}" — assigned units can't be removed; unassign them first.`);
+    await deleteUnitRows(tabName, free.slice(-qty).map((u) => u.index));
+    return { tabName, sku, removed: qty };
+  });
+}
+
+// Unmagnetise: free a unit. The deal itself stays logged (and shows "Not on
+// a unit" on Deals until it's put on another one).
+async function unassignUnit({ tabName, rowNumber, sku, orderId }) {
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const u = await loadExpectedUnit(tabName, rowNumber, { sku, orderId });
+    if (tabName === NEXT_CUSTOM_ORDER_TAB) {
+      await deleteUnitRows(tabName, [u.index]); // queue rows exist only for their customer
+    } else {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.SHEET_ID,
+        range: `'${tabName}'!D${rowNumber}:H${rowNumber}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [['', '', AVAILABLE_STATUS, '', '']] }
+      });
+    }
+    return { tabName, rowNumber: Number(rowNumber), freed: u.row[3] || u.row[7] || 'unit' };
+  });
+}
+
+// Put a logged deal onto a specific free unit (and point the deal's
+// Allocation/Batch at that location so the two views agree).
+async function assignUnit({ tabName, rowNumber, sku, orderId }) {
+  if (!orderId) throw new Error('orderId is required.');
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const u = await loadExpectedUnit(tabName, rowNumber, { sku, orderId: '' });
+    if (unitIsAllocated(u.row)) throw new Error(`That unit is already assigned to ${u.row[3] || 'someone'}.`);
+    const log = await getAutomationLogRows();
+    const entry = log.entries.find((e) => e['Order ID'] === orderId);
+    if (!entry) throw new Error(`No deal found with order ID "${orderId}".`);
+    if (entry['Order Sent Date']) throw new Error('That order has already been sent.');
+    const contact = [entry['Phone'], entry['Email']].filter(Boolean).join(' · ');
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `'${tabName}'!D${rowNumber}:H${rowNumber}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[entry['Customer Name'] || '', contact, 'Needs to be sent', `Order ${orderId}`, orderId]] }
+    });
+    const allocation = tabName === ON_SHORE_TAB ? 'On Shore' : tabName === NEXT_CUSTOM_ORDER_TAB ? 'Next Custom Order' : /on water/i.test(tabName) ? 'On Water' : 'In Production';
+    const fields = { 'Allocation': allocation, 'Batch Reference': batchDigits(tabName) ? `Batch ${batchDigits(tabName)}` : '' };
+    if (!entry['SKU']) fields['SKU'] = u.row[0].trim();
+    await setLogFields(log.headers, entry, fields);
+    return { tabName, rowNumber: Number(rowNumber), orderId, customerName: entry['Customer Name'] };
+  });
+}
+
+// Edit the details written on a unit row (name, contact, status, notes).
+const UNIT_EDITABLE = { allocatedTo: 3, contact: 4, status: 5, notes: 6 };
+async function updateUnit({ tabName, rowNumber, sku, orderId, fields }) {
+  return withLock(UNIT_TABS_LOCK, async () => {
+    const u = await loadExpectedUnit(tabName, rowNumber, { sku, orderId });
+    const row = [...u.row];
+    for (const [k, v] of Object.entries(fields || {})) {
+      if (!(k in UNIT_EDITABLE)) throw new Error(`"${k}" can't be edited on a unit.`);
+      row[UNIT_EDITABLE[k]] = String(v ?? '');
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `'${tabName}'!D${rowNumber}:G${rowNumber}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [row.slice(3, 7)] }
+    });
+    return { tabName, rowNumber: Number(rowNumber) };
+  });
 }
 
 async function logSoldDeal({ source, externalRef, customerName, email, phone, freightSold, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, soldDate, product }) {
@@ -1717,6 +1840,17 @@ app.get('/admin/unit-stock', async (_req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Manual stock / unit editing — see the MANUAL STOCK / UNIT EDITING block.
+for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit]]) {
+  app.post(`/admin/${route}`, async (req, res) => {
+    try {
+      res.json({ ok: true, ...(await fn(req.body || {})) });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+}
 
 // Stage moves for per-unit tracking — see the EVERY UNIT, EVERY STAGE block.
 app.post('/admin/start-production-batch', async (req, res) => {
