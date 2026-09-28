@@ -1001,12 +1001,12 @@ async function getUnitStock() {
   return { tabs };
 }
 
-async function logSoldDeal({ source, externalRef, customerName, email, phone, freightSold, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, soldDate }) {
+async function logSoldDeal({ source, externalRef, customerName, email, phone, freightSold, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, soldDate, product }) {
   await ensureAutomationLogTab();
 
   const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   let stockCheckNote = 'Not checked';
-  let productName = '';
+  let productName = product || ''; // explicit name for items with no SKU (tubs, Ice Forge…); overridden by the SKU's name below
   if (sku && quantity) {
     try {
       const check = await checkStockAvailability(sku, Number(quantity));
@@ -1608,7 +1608,7 @@ app.get('/admin/automation-log', async (_req, res) => {
 app.post('/admin/log-sold-deal', async (req, res) => {
   const {
     source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate
+    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate, product
   } = req.body;
   if (!customerName) return res.status(400).json({ error: 'customerName is required' });
   try {
@@ -1616,7 +1616,7 @@ app.post('/admin/log-sold-deal', async (req, res) => {
       ok: true,
       ...(await logSoldDeal({
         source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate
+        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone, freightSold, soldDate, product
       }))
     });
   } catch (err) {
