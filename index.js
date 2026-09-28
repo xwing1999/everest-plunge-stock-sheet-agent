@@ -1841,16 +1841,84 @@ app.get('/admin/unit-stock', async (_req, res) => {
   }
 });
 
+// STOCK HISTORY (2026-09-28) — Xavier: every manual stock edit needs a
+// reason and who made it, kept as a dated log in its own sheet tab. The
+// edit endpoints below refuse to run without both, and write one history
+// row per successful change. Append-only; nothing here edits past rows.
+const STOCK_HISTORY_TAB = process.env.STOCK_HISTORY_TAB || '📜 Stock History';
+const STOCK_HISTORY_HEADERS = ['Timestamp', 'Who', 'Action', 'Location', 'SKU', 'Quantity', 'Customer / Order', 'Reason', 'Details'];
+
+async function ensureStockHistoryTab() {
+  const exists = (await getSheetMeta()).some((s) => s.properties.title === STOCK_HISTORY_TAB);
+  if (exists) return;
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: STOCK_HISTORY_TAB, gridProperties: { frozenRowCount: 1 } } } }] }
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${STOCK_HISTORY_TAB}'!A1`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [STOCK_HISTORY_HEADERS] }
+  });
+}
+
+async function appendStockHistory(row) {
+  await ensureStockHistoryTab();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SHEET_ID,
+    range: `'${STOCK_HISTORY_TAB}'!A:A`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [STOCK_HISTORY_HEADERS.map((h) => row[h] ?? '')] }
+  });
+}
+
+const HISTORY_ACTION = { 'add-units': 'Added units', 'remove-units': 'Removed units', 'unassign-unit': 'Unassigned customer', 'assign-unit': 'Assigned customer', 'update-unit': 'Edited unit details' };
+
 // Manual stock / unit editing — see the MANUAL STOCK / UNIT EDITING block.
 for (const [route, fn] of [['add-units', addUnits], ['remove-units', removeUnits], ['unassign-unit', unassignUnit], ['assign-unit', assignUnit], ['update-unit', updateUnit]]) {
   app.post(`/admin/${route}`, async (req, res) => {
+    const body = req.body || {};
+    const who = (body.who || '').toString().trim();
+    const reason = (body.reason || '').toString().trim();
+    if (!who || !reason) return res.status(400).json({ error: 'Say who you are and give a reason — every stock edit is logged in Stock History.' });
     try {
-      res.json({ ok: true, ...(await fn(req.body || {})) });
+      const result = await fn(body);
+      try {
+        await appendStockHistory({
+          'Timestamp': new Date().toISOString(),
+          'Who': who,
+          'Action': HISTORY_ACTION[route],
+          'Location': body.tabName || '',
+          'SKU': body.sku || '',
+          'Quantity': result.added ?? result.removed ?? (route === 'add-units' || route === 'remove-units' ? body.quantity : 1),
+          'Customer / Order': [result.customerName || result.freed || '', body.orderId || ''].filter(Boolean).join(' · '),
+          'Reason': reason,
+          'Details': route === 'update-unit' ? JSON.stringify(body.fields || {}) : (body.rowNumber ? `Row ${body.rowNumber}` : '')
+        });
+      } catch (err) {
+        result.historyWarning = `Change made, but writing the Stock History row failed: ${err.message}`;
+      }
+      res.json({ ok: true, ...result });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
   });
 }
+
+app.get('/admin/stock-history', async (req, res) => {
+  try {
+    await ensureStockHistoryTab();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: STOCK_HISTORY_TAB });
+    const [header, ...rows] = r.data.values ?? [];
+    const limit = Math.min(Number(req.query.limit) || 50, 500);
+    const entries = rows.map((row) => Object.fromEntries((header || STOCK_HISTORY_HEADERS).map((h, i) => [h, row[i] ?? '']))).reverse().slice(0, limit);
+    res.json({ entries });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Stage moves for per-unit tracking — see the EVERY UNIT, EVERY STAGE block.
 app.post('/admin/start-production-batch', async (req, res) => {
