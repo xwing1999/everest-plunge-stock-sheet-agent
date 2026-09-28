@@ -520,13 +520,31 @@ const AUTOMATION_LOG_HEADERS = [
   'Quantity', 'Delivery Address', 'Deal Value', 'Stock Check', 'Deposit Status',
   'Final Payment Status', 'Ship Target Date',
   'Allocation', 'Batch Reference', 'Expected Date', 'Order Placed',
-  'Courier', 'Tracking #', 'Order Sent Date', 'Notes'
+  'Courier', 'Tracking #', 'Order Sent Date', 'Notes',
+  'Phone' // added 2026-09-28 (courier booking needs it) — kept last so existing rows' columns don't shift
 ];
 
 async function ensureAutomationLogTab() {
   const sheetsMeta = await getSheetMeta();
   const exists = sheetsMeta.some((s) => s.properties.title === AUTOMATION_LOG_TAB);
-  if (exists) return;
+  if (exists) {
+    // Columns added after a tab was created (e.g. Phone, 2026-09-28) are
+    // appended to its existing header row so reads/edits pick them up.
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range: `'${AUTOMATION_LOG_TAB}'!1:1` });
+    const header = (res.data.values && res.data.values[0]) || [];
+    if (header[0] === 'Order ID') {
+      const missing = AUTOMATION_LOG_HEADERS.filter((h) => !header.includes(h));
+      if (missing.length) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: process.env.SHEET_ID,
+          range: `'${AUTOMATION_LOG_TAB}'!${columnIndexToLetter(header.length)}1`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [missing] }
+        });
+      }
+    }
+    return;
+  }
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: process.env.SHEET_ID,
@@ -982,7 +1000,7 @@ async function getUnitStock() {
   return { tabs };
 }
 
-async function logSoldDeal({ source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
+async function logSoldDeal({ source, externalRef, customerName, email, phone, sku, quantity, deliveryAddress, dealValue, depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes }) {
   await ensureAutomationLogTab();
 
   const orderId = `EP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1026,7 +1044,8 @@ async function logSoldDeal({ source, externalRef, customerName, email, sku, quan
     expectedDate || '',
     '', // Order Placed — only meaningful for Next Custom Order rows, see markOrderPlaced
     '', '', '', // Courier, Tracking #, Order Sent Date — filled in later via markOrderSent
-    notes || ''
+    notes || '',
+    phone || ''
   ];
 
   await sheets.spreadsheets.values.append({
@@ -1048,7 +1067,7 @@ async function logSoldDeal({ source, externalRef, customerName, email, sku, quan
       unitClaim = await withLock(UNIT_TABS_LOCK, async () => {
         const tabName = await resolveUnitTabName(allocation, batchReference);
         return tabName
-          ? claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, email)
+          ? claimUnitsForOrder(tabName, sku, quantity, orderId, customerName, [phone, email].filter(Boolean).join(' · '))
           : unitClaimFailure(allocation, batchReference);
       });
     } catch (err) {
@@ -1092,7 +1111,8 @@ const EDITABLE_DEAL_FIELDS = {
   allocation: 'Allocation',
   batchReference: 'Batch Reference',
   expectedDate: 'Expected Date',
-  notes: 'Notes'
+  notes: 'Notes',
+  phone: 'Phone'
 };
 
 async function editDealDetails(orderId, fields) {
@@ -1149,7 +1169,7 @@ async function editDealDetails(orderId, fields) {
   // Re-magnet — anything that changes WHICH unit this order should be
   // stuck to (or who it's for) releases the old claimed row and claims the
   // correct one fresh, rather than leaving a stale claim on the old item.
-  const relinkTriggers = ['sku', 'quantity', 'allocation', 'batchReference', 'customerName', 'email'];
+  const relinkTriggers = ['sku', 'quantity', 'allocation', 'batchReference', 'customerName', 'email', 'phone'];
   let unitClaim;
   if (relinkTriggers.some((k) => changedKeys.includes(k)) && entry['Order Sent Date']) {
     // Already shipped — its unit is in the Shipped tab and must not be
@@ -1161,7 +1181,7 @@ async function editDealDetails(orderId, fields) {
       if (!updated['SKU'] || !updated['Allocation']) return { claimed: false, reason: 'No SKU/allocation set — nothing to claim.' };
       const tabName = await resolveUnitTabName(updated['Allocation'], updated['Batch Reference']);
       return tabName
-        ? claimUnitsForOrder(tabName, updated['SKU'], updated['Quantity'], orderId, updated['Customer Name'], updated['Email'])
+        ? claimUnitsForOrder(tabName, updated['SKU'], updated['Quantity'], orderId, updated['Customer Name'], [updated['Phone'], updated['Email']].filter(Boolean).join(' · '))
         : unitClaimFailure(updated['Allocation'], updated['Batch Reference']);
     });
   }
@@ -1585,7 +1605,7 @@ app.get('/admin/automation-log', async (_req, res) => {
 app.post('/admin/log-sold-deal', async (req, res) => {
   const {
     source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes
+    depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone
   } = req.body;
   if (!customerName) return res.status(400).json({ error: 'customerName is required' });
   try {
@@ -1593,7 +1613,7 @@ app.post('/admin/log-sold-deal', async (req, res) => {
       ok: true,
       ...(await logSoldDeal({
         source, externalRef, customerName, email, sku, quantity, deliveryAddress, dealValue,
-        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes
+        depositStatus, finalPaymentStatus, shipTargetDate, allocation, batchReference, expectedDate, notes, phone
       }))
     });
   } catch (err) {
